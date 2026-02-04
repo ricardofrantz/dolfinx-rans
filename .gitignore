@@ -52,6 +52,6 @@ Thumbs.db
 # Jupyter
 .ipynb_checkpoints/
 
-# Claude Code
+# Local state
 .claude/
 LEDGER.md
