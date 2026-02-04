@@ -74,7 +74,6 @@ except ImportError:
 
 import ufl
 from ufl import (
-    CellDiameter,
     TestFunction,
     TrialFunction,
     div,
@@ -289,11 +288,19 @@ def create_channel_mesh(geom: ChannelGeom, Re_tau: float = None):
 
 
 def _generate_stretched_coords(y_first: float, H: float, N: int, growth: float) -> np.ndarray:
-    """Generate geometrically stretched y-coordinates from wall to midplane."""
+    """
+    Generate geometrically stretched y-coordinates from wall to midplane.
+
+    Note: The actual first cell size is computed to exactly fill H with N cells
+    using the given growth rate. The y_first parameter from config is used for
+    y+ reporting and wall BC calculation, but the mesh generator computes its
+    own first cell size from the geometric constraint.
+    """
     if growth == 1.0:
         return np.linspace(0, H, N + 1)
 
-    # Compute actual y_first to exactly fill H with N cells
+    # Compute first cell size to exactly fill H with N cells at given growth rate
+    # Geometric series sum: H = dy1 * (growth^N - 1) / (growth - 1)
     sum_factor = (growth**N - 1) / (growth - 1)
     y_first_actual = H / sum_factor
 
