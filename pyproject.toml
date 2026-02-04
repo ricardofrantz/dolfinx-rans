@@ -1,0 +1,65 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "dolfinx-rans"
+version = "0.1.0"
+description = "RANS turbulence models for DOLFINx"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    { name = "Ricardo Frantz" },
+]
+keywords = [
+    "cfd",
+    "turbulence",
+    "rans",
+    "fenics",
+    "dolfinx",
+    "k-omega",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+dependencies = [
+    "numpy>=1.24",
+    "matplotlib>=3.7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.1",
+]
+
+[project.urls]
+Homepage = "https://github.com/rfrantz/dolfinx-rans"
+Repository = "https://github.com/rfrantz/dolfinx-rans"
+Issues = "https://github.com/rfrantz/dolfinx-rans/issues"
+
+[project.scripts]
+dolfinx-rans = "dolfinx_rans.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/dolfinx_rans"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
