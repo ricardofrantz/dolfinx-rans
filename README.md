@@ -12,23 +12,59 @@ RANS turbulence models for DOLFINx — a FEniCSx-based implementation of Reynold
 - **Periodic boundary conditions** via dolfinx_mpc
 - **MKM DNS validation data** (Re_τ = 180, 590) included
 
-## Requirements
+## Installation
 
-- DOLFINx 0.10.0+
-- dolfinx_mpc (for periodic BCs)
-- numpy, matplotlib
+DOLFINx and dolfinx_mpc require conda-forge (not pip-installable). After setting up the FEniCSx environment, install dolfinx-rans with uv or pip.
+
+### Step 1: Create FEniCSx Environment (conda)
 
 ```bash
-# Install via conda (recommended)
-conda install -c conda-forge fenics-dolfinx dolfinx_mpc
-
-# Or pip (if fenics is available)
-pip install dolfinx-rans
+# Create dedicated environment with DOLFINx 0.10.0+
+conda create -n fenicsx python=3.11
+conda activate fenicsx
+conda install -c conda-forge fenics-dolfinx dolfinx_mpc petsc4py mpi4py
 ```
+
+### Step 2: Install dolfinx-rans (uv)
+
+```bash
+# Activate your FEniCSx environment first
+conda activate fenicsx
+
+# Install dolfinx-rans (editable for development)
+cd dolfinx-rans
+uv pip install -e .
+
+# Or install directly from GitHub
+uv pip install git+https://github.com/ricardofrantz/dolfinx-rans.git
+```
+
+### Alternative: pip install
+
+```bash
+conda activate fenicsx
+pip install -e .
+# or
+pip install git+https://github.com/ricardofrantz/dolfinx-rans.git
+```
+
+### Requirements Summary
+
+| Package | Source | Notes |
+|---------|--------|-------|
+| DOLFINx 0.10.0+ | conda-forge | FEniCSx finite element library |
+| dolfinx_mpc | conda-forge | Multi-point constraints (periodic BCs) |
+| petsc4py | conda-forge | PETSc linear solvers |
+| mpi4py | conda-forge | MPI parallelization |
+| numpy | pip/conda | Numerical arrays |
+| matplotlib | pip/conda | Plotting |
 
 ## Quick Start
 
 ```bash
+# Activate FEniCSx environment
+conda activate fenicsx
+
 # Run solver with config file
 dolfinx-rans examples/channel_re590.json
 
