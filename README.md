@@ -59,6 +59,35 @@ pip install git+https://github.com/ricardofrantz/dolfinx-rans.git
 | numpy | pip/conda | Numerical arrays |
 | matplotlib | pip/conda | Plotting |
 
+### Why dolfinx_mpc?
+
+For turbulent channel flow validation, we need **periodic boundary conditions** in the streamwise direction:
+
+```
+u(x=0, y) = u(x=Lx, y)   for all y
+```
+
+Standard Dirichlet BCs can only *set* values at boundaries — they can't *relate* two boundaries to each other. This is where **Multi-Point Constraints (MPC)** come in.
+
+**What dolfinx_mpc does:**
+- Ties DOFs on the right boundary (x=Lx) to corresponding DOFs on the left boundary (x=0)
+- Modifies the assembled linear system to enforce these constraints
+- Works seamlessly with DOLFINx's assembly routines
+
+**Why periodic + body force (instead of inlet/outlet)?**
+
+| Approach | Problem |
+|----------|---------|
+| Inlet/outlet BCs | Need to specify inlet velocity profile (unknown for turbulent flow) |
+| | Creates entrance effects that contaminate solution |
+| | Requires very long domain to reach fully-developed flow |
+| **Periodic + body force** | Flow driven by f_x = 1 (equivalent to pressure gradient dp/dx = -1) |
+| | Automatically gives fully-developed turbulent channel flow |
+| | Short domain sufficient (Lx = 2π typical) |
+| | Clean comparison to DNS data |
+
+The body force f_x = 1 in nondimensional form maintains friction velocity u_τ = 1, which is the standard scaling for turbulent channel flow validation.
+
 ## Quick Start
 
 ```bash
