@@ -481,33 +481,52 @@ def _plot_convergence_live(history_file: Path, save_path: Path):
 
 def _plot_fields_live(u, p, k, omega, nu_t, domain, geom, Re_tau, step, save_path: Path):
     """
-    Plot field profiles along y at x=Lx/2 during iteration.
+    Plot field profiles + 2D contours during iteration. MPI-safe.
 
-    Saves numbered snapshots: fields_00500.png, fields_01000.png, etc.
-    Also overwrites fields.png with the latest snapshot for quick viewing.
+    Phase 1 (all ranks): extract line profiles and gather 2D fields.
+    Phase 2 (rank 0): matplotlib figure with 3×3 layout.
 
-    Shows 6 panels: u⁺, v⁺, p, k⁺, ω⁺, ν_t/ν
+    Layout:
+        Row 0: 2D contours — u⁺, k⁺, ν_t/ν
+        Row 1: 1D profiles — u⁺ (semilog + law of wall), k⁺, ω⁺ (semilogy)
+        Row 2: 1D profiles — v⁺, p⁺, ν_t/ν
     """
     import matplotlib.pyplot as plt
-    from dolfinx_rans.plotting import extract_fields_on_line
+    from dolfinx_rans.plotting import extract_fields_on_line, gather_scalar_field
 
-    fig, axes = plt.subplots(2, 3, figsize=(14, 7))
-
+    comm = domain.comm
+    nu = 1.0 / Re_tau
     x_mid = geom.Lx / 2
     y_vals = np.linspace(0.001, geom.Ly - 0.001, 80)
+
+    # Phase 1: all ranks participate in extraction
+    u_profile, v_profile, p_profile, k_profile, w_profile, nut_profile = \
+        extract_fields_on_line(
+            [u.sub(0), u.sub(1), p, k, omega, nu_t],
+            y_vals, x_mid, domain, comm=comm,
+        )
+
+    # Gather 2D fields (u.sub(0).collapse() is cheap — DOF mapping, not assembly)
+    ux_x, ux_y, ux_vals = gather_scalar_field(u.sub(0).collapse(), comm)
+    k_x, k_y, k_vals = gather_scalar_field(k, comm)
+    nut_x, nut_y, nut_vals = gather_scalar_field(nu_t, comm)
+
+    # Phase 2: rank 0 only
+    if comm.rank != 0:
+        return
+
     y_plus = y_vals * Re_tau
-    nu = 1.0 / Re_tau
+    fig, axes = plt.subplots(3, 3, figsize=(16, 11))
 
     try:
-        # Single bb_tree build for all 6 fields
-        u_profile, v_profile, p_profile, k_profile, w_profile, nut_profile = \
-            extract_fields_on_line(
-                [u.sub(0), u.sub(1), p, k, omega, nu_t],
-                y_vals, x_mid, domain,
-            )
+        # --- Row 0: 2D contour plots ---
+        from dolfinx_rans.plotting import _tricontour
+        _tricontour(axes[0, 0], ux_x, ux_y, ux_vals, f"u⁺ (max={np.max(ux_vals):.1f})", geom)
+        _tricontour(axes[0, 1], k_x, k_y, k_vals, f"k⁺ (max={np.max(k_vals):.3f})", geom)
+        _tricontour(axes[0, 2], nut_x, nut_y, nut_vals / nu, f"ν_t/ν (max={np.max(nut_vals)/nu:.0f})", geom)
 
-        # u+ (semilog with law-of-the-wall reference)
-        ax = axes[0, 0]
+        # --- Row 1: u+ (semilog), k+, ω+ ---
+        ax = axes[1, 0]
         ax.semilogx(y_plus, u_profile, "b-", linewidth=1.5)
         y_visc = np.linspace(1, 11, 30)
         y_log = np.linspace(11, 300, 30)
@@ -520,33 +539,14 @@ def _plot_fields_live(u, p, k, omega, nu_t, domain, geom, Re_tau, step, save_pat
         ax.legend(fontsize=7, loc="upper left")
         ax.grid(True, alpha=0.3)
 
-        # v (should be ~0 for fully-developed channel)
-        ax = axes[0, 1]
-        ax.plot(y_plus, v_profile, "c-", linewidth=1.5)
-        ax.axhline(0, color="k", linewidth=0.5, alpha=0.3)
-        ax.set_xlabel("y⁺")
-        ax.set_ylabel("v⁺")
-        ax.set_title(f"v⁺ (max |v|={np.max(np.abs(v_profile)):.2e})")
-        ax.grid(True, alpha=0.3)
-
-        # p
-        ax = axes[0, 2]
-        ax.plot(y_plus, p_profile, "k-", linewidth=1.5)
-        ax.set_xlabel("y⁺")
-        ax.set_ylabel("p⁺")
-        ax.set_title(f"p⁺ (range={np.max(p_profile)-np.min(p_profile):.2e})")
-        ax.grid(True, alpha=0.3)
-
-        # k+
-        ax = axes[1, 0]
+        ax = axes[1, 1]
         ax.plot(y_plus, k_profile, "r-", linewidth=1.5)
         ax.set_xlabel("y⁺")
         ax.set_ylabel("k⁺")
         ax.set_title(f"k⁺ (max={np.max(k_profile):.3f})")
         ax.grid(True, alpha=0.3)
 
-        # ω+ (log scale)
-        ax = axes[1, 1]
+        ax = axes[1, 2]
         w_safe = np.maximum(w_profile, 1e-10)
         ax.semilogy(y_plus, w_safe, "g-", linewidth=1.5)
         ax.set_xlabel("y⁺")
@@ -554,8 +554,23 @@ def _plot_fields_live(u, p, k, omega, nu_t, domain, geom, Re_tau, step, save_pat
         ax.set_title(f"ω⁺ (max={np.max(w_profile):.1e})")
         ax.grid(True, alpha=0.3)
 
-        # ν_t/ν
-        ax = axes[1, 2]
+        # --- Row 2: v+, p+, ν_t/ν ---
+        ax = axes[2, 0]
+        ax.plot(y_plus, v_profile, "c-", linewidth=1.5)
+        ax.axhline(0, color="k", linewidth=0.5, alpha=0.3)
+        ax.set_xlabel("y⁺")
+        ax.set_ylabel("v⁺")
+        ax.set_title(f"v⁺ (max |v|={np.max(np.abs(v_profile)):.2e})")
+        ax.grid(True, alpha=0.3)
+
+        ax = axes[2, 1]
+        ax.plot(y_plus, p_profile, "k-", linewidth=1.5)
+        ax.set_xlabel("y⁺")
+        ax.set_ylabel("p⁺")
+        ax.set_title(f"p⁺ (range={np.max(p_profile)-np.min(p_profile):.2e})")
+        ax.grid(True, alpha=0.3)
+
+        ax = axes[2, 2]
         ax.plot(y_plus, nut_profile / nu, "m-", linewidth=1.5)
         ax.set_xlabel("y⁺")
         ax.set_ylabel("ν_t/ν")
@@ -1422,11 +1437,12 @@ def solve_rans_kw(
             vtx_turb.write(t)
 
         # PNG plots — decoupled from VTX
-        if do_snapshot and comm.rank == 0:
-            # Residual history: single file, overwritten each time
-            _plot_convergence_live(results_dir / "history.csv", results_dir / "convergence.png")
-            # Flow fields: numbered files (fields_00500.png, etc.)
+        if do_snapshot:
+            # Flow fields: all ranks must participate (MPI-safe extraction)
             _plot_fields_live(u_, p_, k_, omega_, nu_t_, domain, geom, Re_tau, step, results_dir / "fields.png")
+            if comm.rank == 0:
+                # Residual history: reads CSV, no MPI needed
+                _plot_convergence_live(results_dir / "history.csv", results_dir / "convergence.png")
 
         # Convergence check
         if residual < solve.steady_tol:

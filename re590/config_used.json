@@ -1,0 +1,51 @@
+{
+  "_meta": {
+    "notes": "Pseudo-transient to steady state with adaptive dt",
+    "purpose": "k-\u03c9 channel flow - NONDIMENSIONAL at Re_tau=590",
+    "reference": "MKM DNS (Moser, Kim, Mansour 1999) Re_tau=590"
+  },
+  "geom": {
+    "Lx": 6.28,
+    "Ly": 1.0,
+    "Nx": 48,
+    "Ny": 32,
+    "_comment": "Half-channel [0,\u03b4] with symmetry at top. Ly=\u03b4=1, Ny halved.",
+    "growth_rate": 1.1,
+    "mesh_type": "quad",
+    "use_symmetry": true,
+    "y_first": 0.002
+  },
+  "nondim": {
+    "Re_tau": 590,
+    "use_body_force": true
+  },
+  "solve": {
+    "_comment_under_relax": "k/omega use under_relax_k_omega, nu_t uses under_relax_nu_t (more aggressive damping)",
+    "dt": 0.001,
+    "dt_growth": 1.1,
+    "dt_growth_threshold": 0.8,
+    "dt_max": 0.05,
+    "log_interval": 10,
+    "max_iter": 20000,
+    "out_dir": "re590",
+    "picard_max": 5,
+    "picard_tol": 0.0001,
+    "snapshot_interval": 500,
+    "steady_tol": 1e-06,
+    "t_final": 10000.0,
+    "under_relax_k_omega": 0.7,
+    "under_relax_nu_t": 0.5
+  },
+  "turb": {
+    "C_lim": 0.0,
+    "_comment_C_lim": "Durbin realizability: nu_t <= C_lim*k/(sqrt(6)*|S|). Set 0 to disable. Only used by wilcox2006.",
+    "_comment_model": "Options: 'wilcox2006' (default) or 'sst' (Menter k-\u03c9 SST)",
+    "_comment_omega_min": "Floor on omega to prevent nu_t runaway. omega_min=10 best for U+, lower values improve k+ but over-damp velocity.",
+    "beta_star": 0.09,
+    "k_max": 10.0,
+    "k_min": 1e-10,
+    "model": "wilcox2006",
+    "nu_t_max_factor": 1000.0,
+    "omega_min": 1.0
+  }
+}
