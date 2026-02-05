@@ -246,6 +246,168 @@ class HistoryWriterCSV:
                 self._writer = None
 
 
+def compute_wall_distance_channel(S, use_symmetry: bool = True):
+    """
+    Compute wall distance for channel flow geometry.
+
+    For channel flow:
+    - Half-channel (use_symmetry=True): wall at y=0, symmetry at y=Ly
+      → wall distance = y
+    - Full channel (use_symmetry=False): walls at y=0 and y=Ly
+      → wall distance = min(y, Ly-y)
+
+    Args:
+        S: Scalar function space
+        use_symmetry: True for half-channel, False for full channel
+
+    Returns:
+        y_wall: Function containing wall distance at each DOF
+    """
+    from dolfinx.fem import Function
+    import numpy as np
+
+    domain = S.mesh
+    y_wall = Function(S, name="wall_distance")
+
+    # Get DOF coordinates
+    x_dofs = S.tabulate_dof_coordinates()
+    y_coords = x_dofs[:, 1]
+
+    if use_symmetry:
+        # Half-channel: wall at y=0, wall distance = y
+        y_wall.x.array[:] = y_coords
+    else:
+        # Full channel: walls at y=0 and y=Ly
+        Ly = np.max(y_coords)
+        y_wall.x.array[:] = np.minimum(y_coords, Ly - y_coords)
+
+    # Ensure positive (minimum distance = small epsilon for numerical stability)
+    y_wall.x.array[:] = np.maximum(y_wall.x.array, 1e-10)
+    y_wall.x.scatter_forward()
+
+    return y_wall
+
+
+def prepare_wall_shear_stress(u, domain, nu: float, wall_tag: int = 1):
+    """
+    Precompute forms for wall shear stress evaluation.
+
+    Call once during setup. Returns precomputed state for
+    eval_wall_shear_stress() which is cheap to call each iteration.
+
+    Args:
+        u: Velocity vector function (the Function object whose .x.array changes)
+        domain: Mesh
+        nu: Kinematic viscosity (1/Re_tau for nondimensional)
+        wall_tag: Boundary tag for wall (default 1)
+
+    Returns:
+        dict with precomputed forms and wall_length
+    """
+    from dolfinx.fem import assemble_scalar, form
+    from dolfinx.mesh import locate_entities_boundary, meshtags
+    import ufl
+    from mpi4py import MPI
+    import numpy as np
+
+    comm = domain.comm
+    fdim = domain.topology.dim - 1
+    domain.topology.create_connectivity(fdim, domain.topology.dim)
+
+    def wall_boundary(x):
+        return np.isclose(x[1], 0.0)
+
+    wall_facets = locate_entities_boundary(domain, fdim, wall_boundary)
+
+    num_facets = domain.topology.index_map(fdim).size_local
+    facet_values = np.zeros(num_facets, dtype=np.int32)
+    facet_values[wall_facets] = wall_tag
+    facet_tags = meshtags(domain, fdim, np.arange(num_facets, dtype=np.int32), facet_values)
+
+    ds_wall = ufl.Measure("ds", domain=domain, subdomain_data=facet_tags, subdomain_id=wall_tag)
+
+    # Precompile forms (JIT compilation happens here, not at eval time)
+    grad_u = ufl.grad(u)
+    du_dy = grad_u[0, 1]
+    tau_form = form(nu * du_dy * ds_wall)
+
+    # Wall length is constant — compute once
+    wall_length = assemble_scalar(form(1.0 * ds_wall))
+    wall_length = comm.allreduce(wall_length, op=MPI.SUM)
+
+    return {"tau_form": tau_form, "wall_length": wall_length, "comm": comm}
+
+
+def eval_wall_shear_stress(wss_ctx: dict) -> float:
+    """
+    Evaluate wall shear stress using precomputed forms.
+
+    The velocity Function's .x.array is read automatically during assembly
+    (it was captured by reference in the UFL form).
+
+    Args:
+        wss_ctx: dict returned by prepare_wall_shear_stress()
+
+    Returns:
+        τ_wall: Wall shear stress (averaged over wall)
+    """
+    from dolfinx.fem import assemble_scalar
+    from mpi4py import MPI
+
+    tau_integral = assemble_scalar(wss_ctx["tau_form"])
+    tau_integral = wss_ctx["comm"].allreduce(tau_integral, op=MPI.SUM)
+
+    wall_length = wss_ctx["wall_length"]
+    if wall_length > 0:
+        return tau_integral / wall_length
+    return 0.0
+
+
+def compute_wall_shear_stress(u, domain, nu: float, wall_tag: int = 1) -> float:
+    """
+    Compute wall shear stress τ_wall = ν * (∂u_x/∂y)|_wall.
+
+    Convenience wrapper: prepares + evaluates in one call.
+    For repeated calls, use prepare_wall_shear_stress() + eval_wall_shear_stress().
+    """
+    ctx = prepare_wall_shear_stress(u, domain, nu, wall_tag)
+    return eval_wall_shear_stress(ctx)
+
+
+def compute_bulk_velocity(u, Lx: float, Ly: float) -> float:
+    """
+    Compute bulk velocity U_bulk = (1/A) * integral(u_x dA).
+
+    Args:
+        u: Velocity vector function
+        Lx: Domain length in x (streamwise)
+        Ly: Domain height in y (wall-normal)
+
+    Returns:
+        U_bulk: Bulk (area-averaged) streamwise velocity
+    """
+    from dolfinx.fem import assemble_scalar, form
+    import ufl
+    from mpi4py import MPI
+
+    domain = u.function_space.mesh
+    comm = domain.comm
+
+    # Extract x-component of velocity
+    # For a vector function u = (u_x, u_y), we need the x-component
+    # u.sub(0) returns a view, collapse() creates independent function
+    u_x = u.sub(0).collapse()
+
+    # Integrate u_x over entire domain
+    integral = assemble_scalar(form(u_x * ufl.dx))
+    integral = comm.allreduce(integral, op=MPI.SUM)
+
+    # Domain area
+    A = Lx * Ly
+
+    return integral / A
+
+
 def diagnostics_scalar(f) -> dict[str, float | bool]:
     """Global min/max of a scalar Function (MPI-safe)."""
     import numpy as np

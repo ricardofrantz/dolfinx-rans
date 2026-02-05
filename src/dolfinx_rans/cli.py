@@ -21,12 +21,18 @@ from dolfinx_rans.solver import (
     solve_rans_kw,
 )
 from dolfinx_rans.utils import (
+    compute_bulk_velocity,
     dc_from_dict,
     diagnostics_scalar,
     diagnostics_vector,
     load_json_config,
     prepare_case_dir,
     print_dc_json,
+)
+from dolfinx_rans.plotting import (
+    plot_mesh,
+    plot_final_fields,
+    plot_convergence,
 )
 
 
@@ -88,17 +94,42 @@ Environment:
 
     domain = create_channel_mesh(geom, Re_tau=Re_tau)
 
+    # Plot mesh
+    plot_mesh(domain, geom, save_path=results_dir / "mesh.png")
+
     u, p, k, omega, nu_t, V, Q, S, domain, step, t = solve_rans_kw(
         domain, geom, turb, solve, results_dir, nondim=nondim
     )
 
+    # Plot final results
+    plot_final_fields(u, p, k, omega, nu_t, domain, geom, Re_tau, save_path=results_dir / "final_fields.png")
+
+    # Plot convergence history
+    history_file = results_dir / "history.csv"
+    if history_file.exists():
+        plot_convergence(history_file, save_path=results_dir / "convergence.png")
+
+    # Compute U_bulk (MPI collective - all ranks must call)
+    U_bulk = compute_bulk_velocity(u, geom.Lx, geom.Ly)
+
     if domain.comm.rank == 0:
         ud = diagnostics_vector(u)
+        pd = diagnostics_scalar(p)
         kd = diagnostics_scalar(k)
         wd = diagnostics_scalar(omega)
-        print(f"\nFinal max |u|: {float(ud['umax']):.4f}")
-        print(f"Final k range: [{float(kd['min']):.2e}, {float(kd['max']):.2e}]")
-        print(f"Final ω range: [{float(wd['min']):.2e}, {float(wd['max']):.2e}]")
+        nutd = diagnostics_scalar(nu_t)
+
+        print("\n" + "─" * 50)
+        print("FINAL SOLUTION SUMMARY")
+        print("─" * 50)
+        print(f"  U_bulk:    {U_bulk:.4f}")
+        print(f"  u:         [{float(ud['c0_min']):.4f}, {float(ud['c0_max']):.4f}]")
+        print(f"  v:         [{float(ud['c1_min']):.4f}, {float(ud['c1_max']):.4f}]")
+        print(f"  p:         [{float(pd['min']):.4e}, {float(pd['max']):.4e}]")
+        print(f"  k:         [{float(kd['min']):.4e}, {float(kd['max']):.4e}]")
+        print(f"  ω:         [{float(wd['min']):.4e}, {float(wd['max']):.4e}]")
+        print(f"  ν_t:       [{float(nutd['min']):.4e}, {float(nutd['max']):.4e}]")
+        print("─" * 50)
         print(f"Results saved to {results_dir}/")
         print("=" * 60)
 

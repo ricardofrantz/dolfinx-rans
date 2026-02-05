@@ -1,8 +1,8 @@
 {
   "_meta": {
-    "purpose": "k-ω channel flow - NONDIMENSIONAL at Re_tau=590",
+    "purpose": "k-ω SST channel flow - NONDIMENSIONAL at Re_tau=590",
     "reference": "MKM DNS (Moser, Kim, Mansour 1999) Re_tau=590",
-    "notes": "Pseudo-transient to steady state with adaptive dt"
+    "notes": "k-ω SST model (Menter 1994) - blends k-ω near wall with k-ε in outer layer"
   },
   "geom": {
     "Lx": 6.28,
@@ -20,16 +20,15 @@
     "use_body_force": true
   },
   "turb": {
-    "model": "wilcox2006",
+    "model": "sst",
     "beta_star": 0.09,
     "nu_t_max_factor": 1000.0,
     "omega_min": 1.0,
     "k_min": 1e-10,
     "k_max": 10.0,
     "C_lim": 0.0,
-    "_comment_model": "Options: 'wilcox2006' (default) or 'sst' (Menter k-ω SST)",
-    "_comment_omega_min": "Floor on omega to prevent nu_t runaway. omega_min=10 best for U+, lower values improve k+ but over-damp velocity.",
-    "_comment_C_lim": "Durbin realizability: nu_t <= C_lim*k/(sqrt(6)*|S|). Set 0 to disable. Only used by wilcox2006."
+    "_comment_sst": "k-ω SST: F1 blends k-ω (wall) with k-ε (outer); F2 activates SST ν_t limiter",
+    "_comment_omega_min": "Floor on omega for stability. SST is less sensitive to this than standard k-ω."
   },
   "solve": {
     "dt": 0.001,
@@ -43,9 +42,8 @@
     "picard_tol": 1e-4,
     "under_relax_k_omega": 0.7,
     "under_relax_nu_t": 0.5,
-    "_comment_under_relax": "k/omega use under_relax_k_omega, nu_t uses under_relax_nu_t (more aggressive damping)",
     "log_interval": 10,
     "snapshot_interval": 500,
-    "out_dir": "re590"
+    "out_dir": "re590_sst"
   }
 }

@@ -91,21 +91,54 @@ from ufl import (
 from dolfinx_rans.utils import (
     HistoryWriterCSV,
     StepTablePrinter,
+    compute_bulk_velocity,
+    compute_wall_distance_channel,
     dc_from_dict,
     diagnostics_scalar,
     diagnostics_vector,
+    eval_wall_shear_stress,
     fmt_pair_sci,
     load_json_config,
     prepare_case_dir,
+    prepare_wall_shear_stress,
     print_dc_json,
 )
 
-# k-ω model constants (Wilcox 1998)
-BETA_STAR = 0.09
-BETA = 0.075
-SIGMA_K = 0.5
-SIGMA_W = 0.5
-GAMMA = BETA / BETA_STAR - SIGMA_W * 0.41**2 / np.sqrt(BETA_STAR)  # ≈ 0.556
+# k-ω model constants (Wilcox 2006)
+# Reference: Wilcox, D.C. "Turbulence Modeling for CFD", 3rd ed., DCW Industries, 2006
+BETA_STAR = 0.09  # k destruction coefficient
+BETA_0 = 0.0708  # Base ω destruction coefficient (was 0.075 in 1998)
+SIGMA_K = 0.6  # k diffusion Prandtl number (was 0.5 in 1998)
+SIGMA_W = 0.5  # ω diffusion Prandtl number
+KAPPA = 0.41  # von Kármán constant
+# γ chosen to yield correct log-layer: γ = β₀/β* - σ_ω·κ²/√β*
+GAMMA = BETA_0 / BETA_STAR - SIGMA_W * KAPPA**2 / np.sqrt(BETA_STAR)  # ≈ 0.52
+
+# Wilcox 2006 additions
+SIGMA_D0 = 0.125  # Cross-diffusion coefficient (1/8)
+C_LIM = 0.875  # Stress limiter constant (7/8)
+SQRT_BETA_STAR = np.sqrt(BETA_STAR)
+
+# =============================================================================
+# k-ω SST Model Constants (Menter 1994)
+# Reference: Menter, F.R. "Two-equation eddy-viscosity turbulence models
+#            for engineering applications." AIAA Journal, 32(8), 1994.
+# =============================================================================
+
+# Inner layer (k-ω) constants - subscript 1
+SST_SIGMA_K1 = 0.85
+SST_SIGMA_W1 = 0.5
+SST_BETA1 = 0.075
+SST_GAMMA1 = SST_BETA1 / BETA_STAR - SST_SIGMA_W1 * KAPPA**2 / np.sqrt(BETA_STAR)
+
+# Outer layer (k-ε transformed) constants - subscript 2
+SST_SIGMA_K2 = 1.0
+SST_SIGMA_W2 = 0.856
+SST_BETA2 = 0.0828
+SST_GAMMA2 = SST_BETA2 / BETA_STAR - SST_SIGMA_W2 * KAPPA**2 / np.sqrt(BETA_STAR)
+
+# SST limiter constant
+SST_A1 = 0.31
 
 
 # =============================================================================
@@ -118,12 +151,13 @@ class ChannelGeom:
     """Channel geometry parameters."""
 
     Lx: float  # Channel length (streamwise)
-    Ly: float  # Channel height (2δ where δ = half-height)
+    Ly: float  # Channel height (δ if use_symmetry, else 2δ)
     Nx: int  # Mesh cells in x
     Ny: int  # Mesh cells in y
     mesh_type: str  # "triangle" or "quad"
     y_first: float  # First cell height from wall (for y+ control)
     growth_rate: float  # Geometric stretching ratio (>1 for wall refinement)
+    use_symmetry: bool = True  # Half-channel with symmetry BC at top (default: True)
 
 
 @dataclass(frozen=True)
@@ -139,12 +173,13 @@ class TurbParams:
     """
     Turbulence model parameters (all required in config).
 
+    model: Turbulence model - "wilcox2006" or "sst" (default: wilcox2006)
     beta_star: k-ω model constant (standard: 0.09)
     nu_t_max_factor: Max ν_t/ν ratio for stability
     omega_min: Floor on ω to prevent ν_t runaway (10 = best for U+)
     k_min: Floor on k for positivity (1e-10)
     k_max: Cap on k for safety (DNS k+_max ≈ 5)
-    C_lim: Durbin realizability ν_t ≤ C_lim·k/(√6·|S|) (0 = disabled)
+    C_lim: Durbin realizability ν_t ≤ C_lim·k/(√6·|S|) (0 = disabled, SST uses internal limiter)
     """
 
     beta_star: float
@@ -153,6 +188,7 @@ class TurbParams:
     k_min: float
     k_max: float
     C_lim: float
+    model: str = "wilcox2006"  # "wilcox2006" or "sst"
 
 
 @dataclass(frozen=True)
@@ -191,25 +227,6 @@ class SolveParams:
     snapshot_interval: int
     out_dir: str
 
-    @classmethod
-    def from_dict(cls, d: dict):
-        """Create from config dict. All fields required."""
-        return cls(
-            dt=d["dt"],
-            dt_max=d["dt_max"],
-            dt_growth=d["dt_growth"],
-            dt_growth_threshold=d["dt_growth_threshold"],
-            t_final=d["t_final"],
-            max_iter=d["max_iter"],
-            steady_tol=d["steady_tol"],
-            picard_max=d["picard_max"],
-            picard_tol=d["picard_tol"],
-            under_relax_k_omega=d["under_relax_k_omega"],
-            under_relax_nu_t=d["under_relax_nu_t"],
-            log_interval=d["log_interval"],
-            snapshot_interval=d["snapshot_interval"],
-            out_dir=d["out_dir"],
-        )
 
 
 # =============================================================================
@@ -221,11 +238,11 @@ def create_channel_mesh(geom: ChannelGeom, Re_tau: float = None):
     """
     Create channel mesh with optional wall refinement.
 
-    If geom.growth_rate > 1.0, creates a wall-refined mesh using geometric
-    stretching. The first cell height is set by geom.y_first.
+    If geom.use_symmetry=True (default), creates half-channel [0, δ] with:
+      - Bottom (y=0): wall (no-slip)
+      - Top (y=δ): symmetry (free-slip, ∂u/∂y=0)
 
-    For low-Re wall treatment, need y+ < 2.5 at first cell center:
-        y_first = y+_target / Re_tau  (in nondim units where delta=1)
+    If geom.use_symmetry=False, creates full channel [0, 2δ] with walls on both sides.
 
     Args:
         geom: Channel geometry parameters
@@ -237,19 +254,20 @@ def create_channel_mesh(geom: ChannelGeom, Re_tau: float = None):
         # Wall-refined mesh with geometric stretching
         Ny = geom.Ny
         Ly = geom.Ly
-        H = Ly / 2.0  # Half-height
 
-        # Generate stretched distribution for lower half [0, H]
-        y_lower = _generate_stretched_coords(geom.y_first, H, Ny // 2, geom.growth_rate)
-
-        # Mirror for upper half [H, Ly]
-        y_upper = Ly - y_lower[::-1]
-
-        # Combine (remove duplicate at center)
-        y_coords = np.concatenate([y_lower, y_upper[1:]])
-
-        # Uniform x distribution
-        x_coords = np.linspace(0, geom.Lx, geom.Nx + 1)
+        if geom.use_symmetry:
+            # Half-channel: only [0, Ly] with wall at bottom, symmetry at top
+            y_coords = _generate_stretched_coords(geom.y_first, Ly, Ny, geom.growth_rate)
+            if comm.rank == 0:
+                print(f"Half-channel (symmetry at y={Ly:.2f})")
+        else:
+            # Full channel: [0, Ly] with walls at both ends
+            H = Ly / 2.0  # Half-height
+            y_lower = _generate_stretched_coords(geom.y_first, H, Ny // 2, geom.growth_rate)
+            y_upper = Ly - y_lower[::-1]
+            y_coords = np.concatenate([y_lower, y_upper[1:]])
+            if comm.rank == 0:
+                print(f"Full channel (walls at y=0 and y={Ly:.2f})")
 
         # Report y+ at first cell
         if comm.rank == 0 and Re_tau is not None:
@@ -258,8 +276,8 @@ def create_channel_mesh(geom: ChannelGeom, Re_tau: float = None):
             if y_plus_first > 2.5:
                 print("  WARNING: y+ > 2.5, low-Re wall BC may be inaccurate")
 
-        # Create mesh from coordinates
-        domain = _create_mesh_from_coords(x_coords, y_coords, geom.mesh_type)
+        # Create mesh with stretched coordinates
+        domain = _create_stretched_mesh(geom.Lx, Ly, geom.Nx, Ny, y_coords, geom.mesh_type)
     else:
         # Uniform mesh
         if geom.mesh_type == "triangle":
@@ -316,47 +334,34 @@ def _generate_stretched_coords(y_first: float, H: float, N: int, growth: float) 
     return y
 
 
-def _create_mesh_from_coords(x_coords: np.ndarray, y_coords: np.ndarray, mesh_type: str):
-    """Create mesh from x and y coordinate arrays."""
-    import basix
-    from dolfinx.mesh import CellType, create_mesh
-
-    Nx = len(x_coords) - 1
-    Ny = len(y_coords) - 1
-
-    # Create vertices
-    vertices = []
-    for j, y in enumerate(y_coords):
-        for i, x in enumerate(x_coords):
-            vertices.append([x, y])
-    vertices = np.array(vertices, dtype=np.float64)
-
-    # Create cells
-    cells = []
-    for j in range(Ny):
-        for i in range(Nx):
-            v0 = j * (Nx + 1) + i
-            v1 = v0 + 1
-            v2 = v0 + (Nx + 1)
-            v3 = v2 + 1
-            if mesh_type == "triangle":
-                cells.append([v0, v1, v2])
-                cells.append([v1, v3, v2])
-            else:
-                cells.append([v0, v1, v3, v2])
-    cells = np.array(cells, dtype=np.int64)
-
+def _create_stretched_mesh(Lx: float, Ly: float, Nx: int, Ny: int, y_coords: np.ndarray, mesh_type: str):
+    """Create mesh with stretched y-coordinates by deforming a uniform mesh."""
+    # Create uniform mesh first
     if mesh_type == "triangle":
         cell_type = CellType.triangle
     else:
         cell_type = CellType.quadrilateral
 
-    domain = create_mesh(
+    domain = mesh.create_rectangle(
         MPI.COMM_WORLD,
-        cells,
-        vertices,
-        basix.ufl.element("Lagrange", cell_type.name, 1, shape=(2,)),
+        [[0.0, 0.0], [Lx, Ly]],
+        [Nx, Ny],
+        cell_type=cell_type,
     )
+
+    # Deform mesh: map uniform y to stretched y
+    x = domain.geometry.x
+    y_uniform = np.linspace(0, Ly, Ny + 1)
+
+    for i in range(x.shape[0]):
+        y_old = x[i, 1]
+        # Find which interval y_old falls into and interpolate
+        idx = np.searchsorted(y_uniform, y_old, side="right") - 1
+        idx = max(0, min(idx, Ny - 1))
+        # Linear interpolation within the cell
+        t = (y_old - y_uniform[idx]) / (y_uniform[idx + 1] - y_uniform[idx]) if y_uniform[idx + 1] != y_uniform[idx] else 0
+        x[i, 1] = y_coords[idx] + t * (y_coords[idx + 1] - y_coords[idx])
+
     return domain
 
 
@@ -389,10 +394,21 @@ def mark_boundaries(domain, Lx: float, Ly: float):
 # =============================================================================
 
 
-def initial_velocity_channel(x, u_bulk: float, Ly: float):
-    """Parabolic initial velocity."""
-    eta = 2.0 * x[1] / Ly - 1.0
-    u_profile = 1.5 * u_bulk * (1.0 - eta**2)
+def initial_velocity_channel(x, u_bulk: float, Ly: float, use_symmetry: bool = True):
+    """Parabolic initial velocity profile.
+
+    For half-channel (use_symmetry=True): y ∈ [0, δ], u = u_max * (1 - (1-y/δ)²)
+    For full channel: y ∈ [0, 2δ], u = u_max * (1 - (y/δ - 1)²)
+    """
+    if use_symmetry:
+        # Half-channel: y=0 is wall, y=Ly is centerline
+        # u = 0 at y=0, u = u_max at y=Ly
+        eta = x[1] / Ly  # η ∈ [0, 1]
+        u_profile = 1.5 * u_bulk * (2*eta - eta**2)  # parabolic: 0 at wall, max at center
+    else:
+        # Full channel: y=0 and y=Ly are walls, centerline at y=Ly/2
+        eta = 2.0 * x[1] / Ly - 1.0  # η ∈ [-1, 1]
+        u_profile = 1.5 * u_bulk * (1.0 - eta**2)
     return np.vstack([u_profile, np.zeros(x.shape[1], dtype=PETSc.ScalarType)])
 
 
@@ -413,13 +429,152 @@ def initial_omega_channel(x, u_bulk: float, H: float, nu: float):
     y_wall = np.minimum(y, Ly - y)
     y_wall = np.maximum(y_wall, 1e-10)
 
-    omega_wall = 6.0 * nu / (BETA * y_wall**2)
+    omega_wall = 6.0 * nu / (BETA_0 * y_wall**2)
     omega_wall = np.minimum(omega_wall, 1e8)
 
     blend = np.tanh(y_wall / (0.1 * H)) ** 2
     omega = (1 - blend) * omega_wall + blend * omega_bulk
 
     return np.maximum(omega, 1e-6).astype(PETSc.ScalarType)
+
+
+# =============================================================================
+# Live plotting during iteration
+# =============================================================================
+
+
+def _plot_convergence_live(history_file: Path, save_path: Path):
+    """Plot convergence history from CSV (called during iteration)."""
+    import csv
+    import matplotlib.pyplot as plt
+
+    if not history_file.exists():
+        return
+
+    iters, residuals, res_u, res_k, res_w = [], [], [], [], []
+    with open(history_file) as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            iters.append(int(row["iter"]))
+            residuals.append(float(row["residual"]))
+            res_u.append(float(row.get("res_u", row["residual"])))
+            res_k.append(float(row.get("res_k", row["residual"])))
+            res_w.append(float(row.get("res_w", row["residual"])))
+
+    if len(iters) < 2:
+        return
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.semilogy(iters, residuals, "k-", linewidth=2, label="max(u,k,ω)")
+    ax.semilogy(iters, res_u, "b--", linewidth=1, alpha=0.7, label="u")
+    ax.semilogy(iters, res_k, "r--", linewidth=1, alpha=0.7, label="k")
+    ax.semilogy(iters, res_w, "g--", linewidth=1, alpha=0.7, label="ω")
+    ax.axhline(1e-6, color="gray", linestyle=":", alpha=0.5, label="tol=1e-6")
+    ax.set_xlabel("Iteration")
+    ax.set_ylabel("Residual (relative L2 norm)")
+    ax.set_title("Convergence History")
+    ax.legend(loc="upper right")
+    ax.grid(True, alpha=0.3)
+    fig.savefig(save_path, dpi=100, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _plot_fields_live(u, p, k, omega, nu_t, domain, geom, Re_tau, step, save_path: Path):
+    """
+    Plot field profiles along y at x=Lx/2 during iteration.
+
+    Saves numbered snapshots: fields_00500.png, fields_01000.png, etc.
+    Also overwrites fields.png with the latest snapshot for quick viewing.
+
+    Shows 6 panels: u⁺, v⁺, p, k⁺, ω⁺, ν_t/ν
+    """
+    import matplotlib.pyplot as plt
+    from dolfinx_rans.plotting import extract_fields_on_line
+
+    fig, axes = plt.subplots(2, 3, figsize=(14, 7))
+
+    x_mid = geom.Lx / 2
+    y_vals = np.linspace(0.001, geom.Ly - 0.001, 80)
+    y_plus = y_vals * Re_tau
+    nu = 1.0 / Re_tau
+
+    try:
+        # Single bb_tree build for all 6 fields
+        u_profile, v_profile, p_profile, k_profile, w_profile, nut_profile = \
+            extract_fields_on_line(
+                [u.sub(0), u.sub(1), p, k, omega, nu_t],
+                y_vals, x_mid, domain,
+            )
+
+        # u+ (semilog with law-of-the-wall reference)
+        ax = axes[0, 0]
+        ax.semilogx(y_plus, u_profile, "b-", linewidth=1.5)
+        y_visc = np.linspace(1, 11, 30)
+        y_log = np.linspace(11, 300, 30)
+        ax.semilogx(y_visc, y_visc, "k--", linewidth=0.8, alpha=0.4, label="u⁺=y⁺")
+        ax.semilogx(y_log, 2.5 * np.log(y_log) + 5.5, "k:", linewidth=0.8, alpha=0.4, label="log law")
+        ax.set_xlabel("y⁺")
+        ax.set_ylabel("u⁺")
+        ax.set_title(f"u⁺ (max={np.max(u_profile):.1f})")
+        ax.set_xlim(1, Re_tau)
+        ax.legend(fontsize=7, loc="upper left")
+        ax.grid(True, alpha=0.3)
+
+        # v (should be ~0 for fully-developed channel)
+        ax = axes[0, 1]
+        ax.plot(y_plus, v_profile, "c-", linewidth=1.5)
+        ax.axhline(0, color="k", linewidth=0.5, alpha=0.3)
+        ax.set_xlabel("y⁺")
+        ax.set_ylabel("v⁺")
+        ax.set_title(f"v⁺ (max |v|={np.max(np.abs(v_profile)):.2e})")
+        ax.grid(True, alpha=0.3)
+
+        # p
+        ax = axes[0, 2]
+        ax.plot(y_plus, p_profile, "k-", linewidth=1.5)
+        ax.set_xlabel("y⁺")
+        ax.set_ylabel("p⁺")
+        ax.set_title(f"p⁺ (range={np.max(p_profile)-np.min(p_profile):.2e})")
+        ax.grid(True, alpha=0.3)
+
+        # k+
+        ax = axes[1, 0]
+        ax.plot(y_plus, k_profile, "r-", linewidth=1.5)
+        ax.set_xlabel("y⁺")
+        ax.set_ylabel("k⁺")
+        ax.set_title(f"k⁺ (max={np.max(k_profile):.3f})")
+        ax.grid(True, alpha=0.3)
+
+        # ω+ (log scale)
+        ax = axes[1, 1]
+        w_safe = np.maximum(w_profile, 1e-10)
+        ax.semilogy(y_plus, w_safe, "g-", linewidth=1.5)
+        ax.set_xlabel("y⁺")
+        ax.set_ylabel("ω⁺")
+        ax.set_title(f"ω⁺ (max={np.max(w_profile):.1e})")
+        ax.grid(True, alpha=0.3)
+
+        # ν_t/ν
+        ax = axes[1, 2]
+        ax.plot(y_plus, nut_profile / nu, "m-", linewidth=1.5)
+        ax.set_xlabel("y⁺")
+        ax.set_ylabel("ν_t/ν")
+        ax.set_title(f"ν_t/ν (max={np.max(nut_profile)/nu:.0f})")
+        ax.grid(True, alpha=0.3)
+
+    except Exception as e:
+        for ax in axes.flat:
+            ax.text(0.5, 0.5, f"Extract failed:\n{e}", ha="center", va="center",
+                    transform=ax.transAxes, fontsize=8)
+
+    fig.suptitle(f"Iteration {step}", fontsize=12, fontweight="bold")
+    plt.tight_layout()
+
+    # Save numbered snapshot AND latest (for quick viewing)
+    numbered = save_path.parent / f"fields_{step:05d}.png"
+    fig.savefig(numbered, dpi=150, bbox_inches="tight")
+    fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
 
 
 # =============================================================================
@@ -454,7 +609,7 @@ def solve_rans_kw(
     comm = domain.comm
 
     Ly = geom.Ly
-    H = Ly / 2.0
+    H = Ly if geom.use_symmetry else Ly / 2.0  # H = δ (half-channel height)
 
     # Nondimensional mode
     Re_tau = nondim.Re_tau
@@ -464,9 +619,9 @@ def solve_rans_kw(
     u_bulk_init = 15.0  # Conservative initial
 
     if comm.rank == 0:
-        print(f"NONDIMENSIONAL MODE: Re_τ = {Re_tau}")
-        print(f"  ν* = 1/Re_τ = {nu:.6f}")
-        print(f"  Body force: f_x = {1.0 if use_body_force else 0.0}")
+        print(f"NONDIMENSIONAL MODE: Re_τ = {Re_tau}", flush=True)
+        print(f"  ν* = 1/Re_τ = {nu:.6f}", flush=True)
+        print(f"  Body force: f_x = {1.0 if use_body_force else 0.0}", flush=True)
 
     dt = solve.dt
     k_min = turb.k_min
@@ -481,17 +636,43 @@ def solve_rans_kw(
 
     # Boundary facets
     bottom_facets, top_facets, left_facets, right_facets = mark_boundaries(domain, geom.Lx, Ly)
-    wall_facets_tb = np.concatenate([bottom_facets, top_facets])
-
-    wall_dofs_V0 = locate_dofs_topological(V0, fdim, wall_facets_tb)
-    wall_dofs_S0 = locate_dofs_topological(S0, fdim, wall_facets_tb)
-
-    u_noslip = np.array([0.0, 0.0], dtype=PETSc.ScalarType)
-    bc_walls_u0 = dirichletbc(u_noslip, wall_dofs_V0, V0)
 
     y_first = geom.y_first
-    omega_wall_val = 6.0 * nu / (BETA * y_first**2)
-    bc_k_wall0 = dirichletbc(PETSc.ScalarType(0.0), wall_dofs_S0, S0)
+    omega_wall_val = 6.0 * nu / (BETA_0 * y_first**2)
+
+    if geom.use_symmetry:
+        # Half-channel: wall at bottom, symmetry at top
+        # Bottom: no-slip (u=0, v=0), k=0, ω=ω_wall
+        # Top: symmetry (v=0, du/dy=0 natural, dk/dy=0 natural, dω/dy=0 natural)
+        wall_facets_tb = bottom_facets  # Only bottom wall for symmetry case
+        wall_dofs_V0 = locate_dofs_topological(V0, fdim, bottom_facets)
+        wall_dofs_S0 = locate_dofs_topological(S0, fdim, bottom_facets)
+
+        u_noslip = np.array([0.0, 0.0], dtype=PETSc.ScalarType)
+        bc_walls_u0 = dirichletbc(u_noslip, wall_dofs_V0, V0)
+        bc_k_wall0 = dirichletbc(PETSc.ScalarType(0.0), wall_dofs_S0, S0)
+
+        # Symmetry BC at top: v=0 (y-component only)
+        # DOLFINx 0.10.0 requires Function on collapsed subspace for subspace BC
+        V0_y_sub = V0.sub(1)
+        V0_y_collapsed, _ = V0_y_sub.collapse()
+        zero_vy = Function(V0_y_collapsed)
+        zero_vy.x.array[:] = 0.0
+        top_dofs_Vy = locate_dofs_topological((V0_y_sub, V0_y_collapsed), fdim, top_facets)
+        bc_sym_v0 = dirichletbc(zero_vy, top_dofs_Vy, V0_y_sub)
+
+        bcs_u0 = [bc_walls_u0, bc_sym_v0]
+    else:
+        # Full channel: walls at both top and bottom
+        wall_facets_tb = np.concatenate([bottom_facets, top_facets])
+        wall_dofs_V0 = locate_dofs_topological(V0, fdim, wall_facets_tb)
+        wall_dofs_S0 = locate_dofs_topological(S0, fdim, wall_facets_tb)
+
+        u_noslip = np.array([0.0, 0.0], dtype=PETSc.ScalarType)
+        bc_walls_u0 = dirichletbc(u_noslip, wall_dofs_V0, V0)
+        bc_k_wall0 = dirichletbc(PETSc.ScalarType(0.0), wall_dofs_S0, S0)
+
+        bcs_u0 = [bc_walls_u0]
 
     use_periodic = use_body_force
     mpc_V = None
@@ -514,7 +695,7 @@ def solve_rans_kw(
             return y
 
         mpc_V = MultiPointConstraint(V0)
-        mpc_V.create_periodic_constraint_geometrical(V0, periodic_boundary, periodic_relation, [bc_walls_u0])
+        mpc_V.create_periodic_constraint_geometrical(V0, periodic_boundary, periodic_relation, bcs_u0)
         mpc_V.finalize()
 
         mpc_Q = MultiPointConstraint(Q0)
@@ -532,9 +713,10 @@ def solve_rans_kw(
         V, Q, S = V0, Q0, S0
 
     if comm.rank == 0:
-        print(f"Velocity DOFs: {V.dofmap.index_map.size_global}")
-        print(f"Pressure DOFs: {Q.dofmap.index_map.size_global}")
-        print(f"Turbulence DOFs: {S.dofmap.index_map.size_global}")
+        print(f"Velocity DOFs: {V.dofmap.index_map.size_global}", flush=True)
+        print(f"Pressure DOFs: {Q.dofmap.index_map.size_global}", flush=True)
+        print(f"Scalar DOFs (k, ω): {S.dofmap.index_map.size_global}", flush=True)
+        print("Setting up BCs...", flush=True)
 
     # Trial/test functions
     u = TrialFunction(V)
@@ -565,7 +747,40 @@ def solve_rans_kw(
     nu_t_ = Function(S, name="nu_t")
     nu_t_old = Function(S)
 
-    S_mag_ = Function(S, name="S_magnitude") if C_lim > 0 else None
+    # S_magnitude needed for stress limiter (always computed)
+    S_mag_ = Function(S, name="S_magnitude")
+
+    # Determine turbulence model
+    use_sst = turb.model.lower() == "sst"
+    if comm.rank == 0:
+        model_name = "k-ω SST (Menter 1994)" if use_sst else "k-ω (Wilcox 2006)"
+        print(f"Turbulence model: {model_name}")
+
+    # SST-specific: wall distance and blending functions
+    if use_sst:
+        y_wall = compute_wall_distance_channel(S, geom.use_symmetry)
+        F1_ = Function(S, name="F1")  # Blending function (1 near wall, 0 in freestream)
+        F2_ = Function(S, name="F2")  # SST limiter blending
+        # Blended coefficients (will be updated each iteration)
+        sigma_k_blend = Function(S, name="sigma_k")
+        sigma_w_blend = Function(S, name="sigma_w")
+        beta_blend = Function(S, name="beta")
+        gamma_blend = Function(S, name="gamma")
+        # Initialize blending to inner layer (F1=1)
+        F1_.x.array[:] = 1.0
+        F2_.x.array[:] = 1.0
+        sigma_k_blend.x.array[:] = SST_SIGMA_K1
+        sigma_w_blend.x.array[:] = SST_SIGMA_W1
+        beta_blend.x.array[:] = SST_BETA1
+        gamma_blend.x.array[:] = SST_GAMMA1
+    else:
+        y_wall = None
+        F1_ = None
+        F2_ = None
+        sigma_k_blend = None
+        sigma_w_blend = None
+        beta_blend = None
+        gamma_blend = None
 
     # Constants
     dt_c = Constant(domain, PETSc.ScalarType(dt))
@@ -573,10 +788,22 @@ def solve_rans_kw(
     rho_c = Constant(domain, PETSc.ScalarType(rho))
 
     beta_star_c = Constant(domain, PETSc.ScalarType(turb.beta_star))
-    beta_c = Constant(domain, PETSc.ScalarType(BETA))
-    gamma_c = Constant(domain, PETSc.ScalarType(GAMMA))
-    sigma_k_c = Constant(domain, PETSc.ScalarType(SIGMA_K))
-    sigma_w_c = Constant(domain, PETSc.ScalarType(SIGMA_W))
+
+    # For Wilcox 2006, use fixed constants; for SST, these will be overridden
+    if not use_sst:
+        beta_c = Constant(domain, PETSc.ScalarType(BETA_0))
+        gamma_c = Constant(domain, PETSc.ScalarType(GAMMA))
+        sigma_k_c = Constant(domain, PETSc.ScalarType(SIGMA_K))
+        sigma_w_c = Constant(domain, PETSc.ScalarType(SIGMA_W))
+    else:
+        # For SST, use Functions for blended coefficients (updated each iteration)
+        # We'll use these in the weak form
+        beta_c = beta_blend
+        gamma_c = gamma_blend
+        sigma_k_c = sigma_k_blend
+        sigma_w_c = sigma_w_blend
+
+    sigma_d_c = Constant(domain, PETSc.ScalarType(SIGMA_D0))  # Cross-diffusion
 
     if use_body_force:
         f = Constant(domain, PETSc.ScalarType((1.0, 0.0)))
@@ -586,7 +813,7 @@ def solve_rans_kw(
         f = Constant(domain, PETSc.ScalarType((0.0, 0.0)))
 
     # Initial conditions
-    u_n.interpolate(lambda x: initial_velocity_channel(x, u_bulk_init, Ly))
+    u_n.interpolate(lambda x: initial_velocity_channel(x, u_bulk_init, Ly, geom.use_symmetry))
     u_n1.x.array[:] = u_n.x.array
     u_.x.array[:] = u_n.x.array
 
@@ -618,11 +845,23 @@ def solve_rans_kw(
     wall_dofs_S_tb = locate_dofs_topological(S, fdim, wall_facets_tb)
 
     bc_walls_u = dirichletbc(u_noslip, wall_dofs_V_tb, V)
-    if use_periodic:
-        bcu = [bc_walls_u]
-        bcp = []
+
+    # Build velocity BCs list
+    if geom.use_symmetry:
+        # Add symmetry BC at top: v=0 (y-component only) for the solve loop
+        V_y_sub = V.sub(1)
+        V_y_collapsed, _ = V_y_sub.collapse()
+        zero_vy_solve = Function(V_y_collapsed)
+        zero_vy_solve.x.array[:] = 0.0
+        top_dofs_Vy_solve = locate_dofs_topological((V_y_sub, V_y_collapsed), fdim, top_facets)
+        bc_sym_v = dirichletbc(zero_vy_solve, top_dofs_Vy_solve, V_y_sub)
+        bcu = [bc_walls_u, bc_sym_v]
     else:
         bcu = [bc_walls_u]
+
+    if use_periodic:
+        bcp = []
+    else:
         outlet_dofs_Q = locate_dofs_topological(Q, fdim, right_facets)
         bc_pressure = dirichletbc(PETSc.ScalarType(0.0), outlet_dofs_Q, Q)
         bcp = [bc_pressure]
@@ -634,10 +873,12 @@ def solve_rans_kw(
     bcw = [bc_w_wall]
 
     if comm.rank == 0:
-        print(f"Wall ω BC: ω_wall = {omega_wall_val:.2e} (y_first = {y_first})")
+        print(f"Wall ω BC: ω_wall = {omega_wall_val:.2e} (y_first = {y_first})", flush=True)
+        print("Setting up weak forms...", flush=True)
+
+    comm.barrier()  # Sync before form setup
 
     # Turbulence forms
-    k_safe = k_prev
     omega_safe = omega_prev
 
     D_k = nu_c + sigma_k_c * nu_t_
@@ -647,10 +888,15 @@ def solve_rans_kw(
     S_sq = 2.0 * inner(S_tensor, S_tensor)
     P_k = nu_t_ * S_sq
 
-    S_mag_expr = None
-    if C_lim > 0 and S_mag_ is not None:
-        S_mag_ufl = sqrt(S_sq + 1e-16)
-        S_mag_expr = Expression(S_mag_ufl, S.element.interpolation_points())
+    # S_mag expression for stress limiter: |S| = sqrt(2*S_ij*S_ij)
+    S_mag_ufl = sqrt(S_sq + 1e-16)
+    S_mag_expr = Expression(S_mag_ufl, S.element.interpolation_points)
+
+    # Gradient dot product for SST cross-diffusion term: ∇k · ∇ω
+    grad_k_dot_grad_w_ufl = dot(grad(k_n), grad(omega_n))
+    grad_k_dot_grad_w_expr = Expression(grad_k_dot_grad_w_ufl, S.element.interpolation_points)
+    # Function to hold interpolated values
+    grad_k_dot_grad_w_func = Function(S, name="grad_k_dot_grad_w") if use_sst else None
 
     # k-equation
     F_k = (
@@ -671,8 +917,27 @@ def solve_rans_kw(
         A_k = create_matrix(a_k)
         b_k = create_vector(S)
 
-    # ω-equation
+    if comm.rank == 0:
+        print("  k-equation forms ready", flush=True)
+
+    # ω-equation with cross-diffusion term
     P_omega = gamma_c * S_sq
+
+    # Cross-diffusion term: helps reduce freestream sensitivity
+    # We use omega_n (from previous step) to avoid implicit coupling
+    grad_k_dot_grad_w = dot(grad(k_n), grad(omega_n))
+    # max(0, ∇k·∇ω) via UFL conditional
+    grad_kw_positive = ufl.conditional(ufl.gt(grad_k_dot_grad_w, 0.0), grad_k_dot_grad_w, 0.0)
+
+    if use_sst:
+        # SST: CD = (1-F1) * 2*σ_ω2/ω * max(0, ∇k·∇ω)
+        # F1_=1 near wall → no cross-diffusion (k-ω behavior)
+        # F1_=0 away from wall → full cross-diffusion (k-ε transformed)
+        sigma_w2_c = Constant(domain, PETSc.ScalarType(2.0 * SST_SIGMA_W2))
+        cross_diff = (1.0 - F1_) * sigma_w2_c / omega_safe * grad_kw_positive
+    else:
+        # Wilcox 2006: CD = σ_d/ω * max(0, ∇k·∇ω)
+        cross_diff = sigma_d_c / omega_safe * grad_kw_positive
 
     F_w = (
         (w_trial - omega_n) / dt_c * phi_w * dx
@@ -680,6 +945,7 @@ def solve_rans_kw(
         + D_w * inner(grad(w_trial), grad(phi_w)) * dx
         + beta_c * omega_safe * w_trial * phi_w * dx
         - P_omega * phi_w * dx
+        + cross_diff * phi_w * dx  # Cross-diffusion (positive = increases ω)
     )
 
     a_w = form(lhs(F_w))
@@ -691,6 +957,9 @@ def solve_rans_kw(
     else:
         A_w = create_matrix(a_w)
         b_w = create_vector(S)
+
+    if comm.rank == 0:
+        print("  ω-equation forms ready", flush=True)
 
     # IPCS momentum
     nu_eff = nu_c + nu_t_
@@ -712,6 +981,9 @@ def solve_rans_kw(
         A1 = create_matrix(a1)
         b1 = create_vector(V)
 
+    if comm.rank == 0:
+        print("  Momentum forms ready", flush=True)
+
     a2 = form(dot(grad(p), grad(q)) * dx)
     L2 = form(-rho_c / dt_c * div(u_s) * q * dx)
     if use_periodic:
@@ -728,6 +1000,9 @@ def solve_rans_kw(
         pressure_nullspace = PETSc.NullSpace().create(constant=True, comm=comm)
         A2.setNullSpace(pressure_nullspace)
 
+    if comm.rank == 0:
+        print("  Pressure forms ready", flush=True)
+
     a3 = form(rho_c * dot(u, v) * dx)
     L3 = form(rho_c * dot(u_s, v) * dx - dt_c * dot(nabla_grad(phi), v) * dx)
     if use_periodic:
@@ -739,17 +1014,21 @@ def solve_rans_kw(
         A3.assemble()
         b3 = create_vector(V)
 
-    # Solvers
+    # Solvers (MPI-compatible preconditioners)
     solver_k = PETSc.KSP().create(comm)
     solver_k.setOperators(A_k)
     solver_k.setType(PETSc.KSP.Type.BCGS)
-    solver_k.getPC().setType(PETSc.PC.Type.ILU)
+    pc_k = solver_k.getPC()
+    pc_k.setType(PETSc.PC.Type.HYPRE)
+    pc_k.setHYPREType("boomeramg")
     solver_k.setTolerances(rtol=1e-8)
 
     solver_w = PETSc.KSP().create(comm)
     solver_w.setOperators(A_w)
     solver_w.setType(PETSc.KSP.Type.BCGS)
-    solver_w.getPC().setType(PETSc.PC.Type.ILU)
+    pc_w = solver_w.getPC()
+    pc_w.setType(PETSc.PC.Type.HYPRE)
+    pc_w.setHYPREType("boomeramg")
     solver_w.setTolerances(rtol=1e-8)
 
     solver1 = PETSc.KSP().create(comm)
@@ -769,8 +1048,11 @@ def solve_rans_kw(
     solver3 = PETSc.KSP().create(comm)
     solver3.setOperators(A3)
     solver3.setType(PETSc.KSP.Type.CG)
-    solver3.getPC().setType(PETSc.PC.Type.SOR)
+    solver3.getPC().setType(PETSc.PC.Type.JACOBI)
     solver3.setTolerances(rtol=1e-8)
+
+    if comm.rank == 0:
+        print("  Linear solvers ready", flush=True)
 
     def assemble_matrix_maybe_mpc(A, a, bcs, mpc):
         A.zeroEntries()
@@ -805,6 +1087,9 @@ def solve_rans_kw(
         if mpc is not None:
             mpc.backsubstitution(func)
 
+    # Precompute wall shear stress forms (JIT compilation happens once here)
+    wss_ctx = prepare_wall_shear_stress(u_, domain, nu)
+
     # VTX output
     vtx_vel = None
     vtx_turb = None
@@ -815,11 +1100,11 @@ def solve_rans_kw(
         vtx_turb.write(0.0)
 
     if comm.rank == 0:
-        print(f"\nSolving RANS k-ω channel flow")
-        print(f"dt={dt}, t_final={solve.t_final}, picard_max={solve.picard_max}")
+        print(f"\nSolving RANS k-ω channel flow", flush=True)
+        print(f"dt={dt}, t_final={solve.t_final}, picard_max={solve.picard_max}", flush=True)
         if solve.snapshot_interval > 0:
-            print(f"Saving snapshots every {solve.snapshot_interval} steps to snps/")
-        print()
+            print(f"Saving snapshots every {solve.snapshot_interval} steps to snps/", flush=True)
+        print(flush=True)
 
     t = 0.0
     step = 0
@@ -833,73 +1118,57 @@ def solve_rans_kw(
             ("iter", 6),
             ("dt", 9),
             ("res", 9),
-            ("|u|max", 9),
+            ("U_bulk", 9),
+            ("τ_wall", 7),  # Should be 1.0 for equilibrium!
+            ("u_max", 9),
             ("k[min,max]", 20),
             ("ω[min,max]", 20),
-            ("nu_t/nu", 12),
+            ("ν_t/ν", 12),
         ])
         hist = HistoryWriterCSV(
             results_dir / "history.csv",
-            ["iter", "dt", "residual", "umax", "k_min", "k_max", "omega_min", "omega_max", "nu_t_max_ratio"],
+            ["iter", "dt", "residual", "res_u", "res_k", "res_w", "U_bulk", "tau_wall", "u_max", "k_min", "k_max", "omega_min", "omega_max", "nu_t_nu_max"],
             enabled=True,
         )
 
+    # Pre-compute loop-invariant values
+    omega_max_limit = 10.0 * omega_wall_val  # ~3.4e+05 for Re_tau=590
+    ur_kw = solve.under_relax_k_omega
+    alpha_u = 0.7  # velocity under-relaxation factor
+
+    u_n_old = np.empty_like(u_n.x.array)
+
+    def field_residual(new_arr, old_arr):
+        diff = new_arr - old_arr
+        diff2 = float(comm.allreduce(np.dot(diff, diff), op=MPI.SUM))
+        norm2 = float(comm.allreduce(np.dot(new_arr, new_arr), op=MPI.SUM))
+        return float(np.sqrt(diff2) / max(np.sqrt(norm2), 1e-10))
+
     # Main iteration loop
+    if comm.rank == 0:
+        print("Entering iteration loop...", flush=True)
+
     while step < solve.max_iter:
         dt_c.value = current_dt
         t += current_dt
         step += 1
 
+        if step == 1 and comm.rank == 0:
+            print("  Starting iteration 1...", flush=True)
+
+        # Save old values for residual computation and under-relaxation
+        # (u_n will be updated inside Picard loop, so save it here)
+        u_n_old[:] = u_n.x.array  # For residual: compare u_new vs u_old
         k_prev.x.array[:] = k_n.x.array
         omega_prev.x.array[:] = omega_n.x.array
         nu_t_old.x.array[:] = nu_t_.x.array
 
         for picard_iter in range(solve.picard_max):
-            # k-equation
-            assemble_matrix_maybe_mpc(A_k, a_k, bck, mpc_S)
-            assemble_vector_maybe_mpc(b_k, L_k, a_k, bck, mpc_S)
-
-            solver_k.solve(b_k, k_.x.petsc_vec)
-            k_.x.scatter_forward()
-            backsubstitute(mpc_S, k_)
-
-            k_.x.array[:] = np.clip(k_.x.array, k_min, k_max_limit)
-            ur_kw = solve.under_relax_k_omega
-            k_.x.array[:] = ur_kw * k_.x.array + (1.0 - ur_kw) * k_prev.x.array
-            k_.x.array[:] = np.clip(k_.x.array, k_min, k_max_limit)
-            k_.x.scatter_forward()
-            backsubstitute(mpc_S, k_)
-
-            # ω-equation
-            assemble_matrix_maybe_mpc(A_w, a_w, bcw, mpc_S)
-            assemble_vector_maybe_mpc(b_w, L_w, a_w, bcw, mpc_S)
-
-            solver_w.solve(b_w, omega_.x.petsc_vec)
-            omega_.x.scatter_forward()
-            backsubstitute(mpc_S, omega_)
-
-            omega_.x.array[:] = np.maximum(omega_.x.array, omega_min)
-            omega_.x.array[:] = ur_kw * omega_.x.array + (1.0 - ur_kw) * omega_prev.x.array
-            omega_.x.array[:] = np.maximum(omega_.x.array, omega_min)
-            omega_.x.scatter_forward()
-            backsubstitute(mpc_S, omega_)
-
-            # Update nu_t with optional Durbin limiter
-            nu_t_raw = k_.x.array / (omega_.x.array + omega_min)
-            if C_lim > 0 and S_mag_expr is not None:
-                S_mag_.interpolate(S_mag_expr)
-                S_mag_arr = S_mag_.x.array
-                SQRT6 = np.sqrt(6.0)
-                S_mag_safe = np.maximum(S_mag_arr, 1e-10)
-                nu_t_durbin = C_lim * k_.x.array / (SQRT6 * S_mag_safe)
-                nu_t_raw = np.minimum(nu_t_raw, nu_t_durbin)
-            nu_t_raw = np.clip(nu_t_raw, 0, turb.nu_t_max_factor * nu)
-            ur_nu_t = solve.under_relax_nu_t
-            nu_t_.x.array[:] = ur_nu_t * nu_t_raw + (1.0 - ur_nu_t) * nu_t_old.x.array
-            nu_t_.x.scatter_forward()
-            backsubstitute(mpc_S, nu_t_)
-
-            # IPCS steps
+            # =========================================================
+            # STEP 1: MOMENTUM (IPCS) - uses current nu_t
+            # =========================================================
+            if step == 1 and picard_iter == 0 and comm.rank == 0:
+                print("    Solving momentum...", flush=True)
             assemble_matrix_maybe_mpc(A1, a1, bcu, mpc_V)
             assemble_vector_maybe_mpc(b1, L1, a1, bcu, mpc_V)
 
@@ -907,6 +1176,11 @@ def solve_rans_kw(
             u_s.x.scatter_forward()
             backsubstitute(mpc_V, u_s)
 
+            # =========================================================
+            # STEP 2: PRESSURE CORRECTION
+            # =========================================================
+            if step == 1 and picard_iter == 0 and comm.rank == 0:
+                print("    Solving pressure...", flush=True)
             assemble_vector_maybe_mpc(b2, L2, a2, bcp, mpc_Q)
             if pressure_nullspace is not None:
                 pressure_nullspace.remove(b2)
@@ -919,13 +1193,148 @@ def solve_rans_kw(
             p_.x.scatter_forward()
             backsubstitute(mpc_Q, p_)
 
+            # =========================================================
+            # STEP 3: VELOCITY CORRECTION
+            # =========================================================
             assemble_vector_no_bc(b3, L3, mpc_V)
 
             solver3.solve(b3, u_.x.petsc_vec)
             u_.x.scatter_forward()
             backsubstitute(mpc_V, u_)
 
-            # Picard check
+            if step == 1 and picard_iter == 0 and comm.rank == 0:
+                print("    Velocity correction done", flush=True)
+
+            # =========================================================
+            # STEP 4: UPDATE u_n WITH UNDER-RELAXATION
+            # This ensures turbulence equations use fresh velocity,
+            # but under-relaxation prevents instability from large changes
+            # =========================================================
+            u_n.x.array[:] = alpha_u * u_.x.array + (1.0 - alpha_u) * u_n_old
+            u_n.x.scatter_forward()
+
+            # =========================================================
+            # STEP 4b: Update SST blending functions BEFORE k/ω solves
+            # This ensures k and ω equations use correct blended coefficients
+            # =========================================================
+            if use_sst:
+                # Get current k, ω values (from previous Picard iter or initial)
+                k_arr = np.maximum(k_.x.array, k_min)
+                omega_arr = np.maximum(omega_.x.array, omega_min)
+                y_arr = y_wall.x.array
+                y_safe = np.maximum(y_arr, 1e-10)
+
+                # Compute ∇k · ∇ω (uses k_n, omega_n from previous timestep)
+                grad_k_dot_grad_w_func.interpolate(grad_k_dot_grad_w_expr)
+                grad_kw_arr = grad_k_dot_grad_w_func.x.array
+                CD_kw = np.maximum(2.0 * SST_SIGMA_W2 / omega_arr * grad_kw_arr, 1e-10)
+
+                # F1: controls k-ω vs k-ε blending
+                term1 = np.sqrt(k_arr) / (BETA_STAR * omega_arr * y_safe)
+                term2 = 500.0 * nu / (y_safe**2 * omega_arr)
+                term3 = 4.0 * SST_SIGMA_W2 * k_arr / (CD_kw * y_safe**2)
+                arg1 = np.minimum(np.maximum(term1, term2), term3)
+                F1_arr = np.tanh(arg1**4)
+
+                # Update F1 (needed for ω equation cross-diffusion term)
+                F1_.x.array[:] = F1_arr
+                F1_.x.scatter_forward()
+
+                # Blend coefficients: φ = F1·φ1 + (1-F1)·φ2
+                sigma_k_blend.x.array[:] = F1_arr * SST_SIGMA_K1 + (1.0 - F1_arr) * SST_SIGMA_K2
+                sigma_w_blend.x.array[:] = F1_arr * SST_SIGMA_W1 + (1.0 - F1_arr) * SST_SIGMA_W2
+                beta_blend.x.array[:] = F1_arr * SST_BETA1 + (1.0 - F1_arr) * SST_BETA2
+                gamma_blend.x.array[:] = F1_arr * SST_GAMMA1 + (1.0 - F1_arr) * SST_GAMMA2
+                sigma_k_blend.x.scatter_forward()
+                sigma_w_blend.x.scatter_forward()
+                beta_blend.x.scatter_forward()
+                gamma_blend.x.scatter_forward()
+
+            # =========================================================
+            # STEP 5: k-equation (now uses updated u_n for production)
+            # =========================================================
+            if step == 1 and picard_iter == 0 and comm.rank == 0:
+                print("    Solving k-equation...", flush=True)
+            assemble_matrix_maybe_mpc(A_k, a_k, bck, mpc_S)
+            assemble_vector_maybe_mpc(b_k, L_k, a_k, bck, mpc_S)
+
+            solver_k.solve(b_k, k_.x.petsc_vec)
+            k_.x.scatter_forward()
+            backsubstitute(mpc_S, k_)
+
+            k_.x.array[:] = np.clip(k_.x.array, k_min, k_max_limit)
+            k_.x.array[:] = ur_kw * k_.x.array + (1.0 - ur_kw) * k_prev.x.array
+            k_.x.scatter_forward()
+            backsubstitute(mpc_S, k_)
+
+            # =========================================================
+            # STEP 6: ω-equation (now uses updated u_n for production)
+            # =========================================================
+            if step == 1 and picard_iter == 0 and comm.rank == 0:
+                print("    Solving ω-equation...", flush=True)
+            assemble_matrix_maybe_mpc(A_w, a_w, bcw, mpc_S)
+            assemble_vector_maybe_mpc(b_w, L_w, a_w, bcw, mpc_S)
+
+            solver_w.solve(b_w, omega_.x.petsc_vec)
+            omega_.x.scatter_forward()
+            backsubstitute(mpc_S, omega_)
+
+            omega_.x.array[:] = np.clip(omega_.x.array, omega_min, omega_max_limit)
+            omega_.x.array[:] = ur_kw * omega_.x.array + (1.0 - ur_kw) * omega_prev.x.array
+            omega_.x.scatter_forward()
+            backsubstitute(mpc_S, omega_)
+
+            # =========================================================
+            # STEP 7: Update nu_t (model-dependent)
+            # =========================================================
+            # Compute strain rate magnitude |S| = sqrt(2*S_ij*S_ij)
+            S_mag_.interpolate(S_mag_expr)
+            S_mag_arr = S_mag_.x.array
+            S_mag_safe = np.maximum(S_mag_arr, 1e-10)
+
+            if use_sst:
+                # =======================================================
+                # SST Model: Compute F2 and apply SST ν_t limiter
+                # (F1 and blended coefficients already updated in Step 4b)
+                # =======================================================
+                k_arr = np.maximum(k_.x.array, k_min)
+                omega_arr = np.maximum(omega_.x.array, omega_min)
+                y_arr = y_wall.x.array
+                y_safe = np.maximum(y_arr, 1e-10)
+
+                # F2 for SST ν_t limiter (computed with UPDATED k, ω)
+                # arg2 = max(2·sqrt(k)/(β*·ω·y), 500·ν/(y²·ω))
+                term2a = 2.0 * np.sqrt(k_arr) / (BETA_STAR * omega_arr * y_safe)
+                term2b = 500.0 * nu / (y_safe**2 * omega_arr)
+                arg2 = np.maximum(term2a, term2b)
+                F2_arr = np.tanh(arg2**2)
+
+                F2_.x.array[:] = F2_arr
+                F2_.x.scatter_forward()
+
+                # SST ν_t limiter: ν_t = a1·k / max(a1·ω, |S|·F2)
+                denominator = np.maximum(SST_A1 * omega_arr, S_mag_safe * F2_arr)
+                nu_t_raw = SST_A1 * k_arr / denominator
+            else:
+                # =======================================================
+                # Wilcox 2006: ν_t = k/ω̃ where ω̃ = max(ω, C_lim·|S|/√β*)
+                # =======================================================
+                omega_tilde = np.maximum(
+                    omega_.x.array + omega_min,
+                    C_lim * S_mag_safe / SQRT_BETA_STAR
+                )
+                nu_t_raw = k_.x.array / omega_tilde
+
+            # Apply limits and under-relaxation (both models)
+            nu_t_raw = np.clip(nu_t_raw, 0, turb.nu_t_max_factor * nu)
+            ur_nu_t = solve.under_relax_nu_t
+            nu_t_.x.array[:] = ur_nu_t * nu_t_raw + (1.0 - ur_nu_t) * nu_t_old.x.array
+            nu_t_.x.scatter_forward()
+            backsubstitute(mpc_S, nu_t_)
+
+            # =========================================================
+            # STEP 8: Picard convergence check
+            # =========================================================
             dk = k_.x.array - k_prev.x.array
             dk_norm = float(np.sqrt(comm.allreduce(np.dot(dk, dk), op=MPI.SUM)))
             k_norm = float(np.sqrt(comm.allreduce(np.dot(k_.x.array, k_.x.array), op=MPI.SUM)))
@@ -938,29 +1347,53 @@ def solve_rans_kw(
             omega_prev.x.array[:] = omega_.x.array
             nu_t_old.x.array[:] = nu_t_.x.array
 
-        # Update for next step
-        u_n1.x.array[:] = u_n.x.array
-        u_n.x.array[:] = u_.x.array
+        # Compute residuals (relative L2 norm of change from previous outer iteration)
+        res_u = field_residual(u_.x.array, u_n_old)  # u^(n+1) vs u^n (saved at start)
+        res_k = field_residual(k_.x.array, k_n.x.array)  # k^(n+1) vs k^n
+        res_w = field_residual(omega_.x.array, omega_n.x.array)  # ω^(n+1) vs ω^n
+        residual = max(res_u, res_k, res_w)  # Converge when ALL fields converge
+
+        # Update for next step: Adams-Bashforth needs u^n and u^{n-1}
+        # CRITICAL: u_n inside Picard loop was under-relaxed for stability.
+        # For the NEXT timestep's AB extrapolation, we need the ACTUAL converged velocity.
+        u_n1.x.array[:] = u_n_old  # u^{n-1} = velocity at start of this timestep
+        u_n.x.array[:] = u_.x.array  # u^n = actual IPCS-corrected velocity (not under-relaxed!)
+        u_n.x.scatter_forward()
         k_n.x.array[:] = k_.x.array
         omega_n.x.array[:] = omega_.x.array
 
-        # Residual
-        du_local = u_.x.array - u_n1.x.array
-        diff2 = float(comm.allreduce(np.dot(du_local, du_local), op=MPI.SUM))
-        norm2 = float(comm.allreduce(np.dot(u_.x.array, u_.x.array), op=MPI.SUM))
-        residual = float(np.sqrt(diff2) / max(np.sqrt(norm2), 1e-10))
+        # =====================================================================
+        # POST-STEP: Logging, CSV, VTX snapshots, and PNG plots
+        # =====================================================================
+        # log_interval:      print to screen + write CSV row (cheap)
+        # snapshot_interval:  save VTX + generate PNG plots (expensive)
+        #
+        # MPI collectives (U_bulk, τ_wall) run at snapshot_interval since
+        # they are only needed for the screen table and are cheap enough.
+        # =====================================================================
 
-        # Log
-        if comm.rank == 0 and table is not None and step % solve.log_interval == 0:
-            ud = diagnostics_vector(u_)
-            kd = diagnostics_scalar(k_)
-            wd = diagnostics_scalar(omega_)
+        do_log = step % solve.log_interval == 0
+        do_snapshot = solve.snapshot_interval > 0 and step % solve.snapshot_interval == 0
+
+        # MPI collectives — all ranks must participate (even if only rank 0 prints)
+        if do_log or do_snapshot:
+            U_bulk = compute_bulk_velocity(u_, geom.Lx, Ly)
+            tau_wall = eval_wall_shear_stress(wss_ctx)
+            ud = diagnostics_vector(u_)   # contains allreduce
+            kd = diagnostics_scalar(k_)   # contains allreduce
+            wd = diagnostics_scalar(omega_)  # contains allreduce
             nu_t_ratio = float(np.max(nu_t_.x.array)) / nu
+        else:
+            U_bulk = 0.0
+            tau_wall = 0.0
 
+        if comm.rank == 0 and table is not None and do_log:
             table.row([
                 f"{step:6d}",
                 f"{current_dt:9.2e}",
                 f"{residual:9.1e}",
+                f"{U_bulk:9.3f}",
+                f"{tau_wall:7.4f}",
                 f"{float(ud['umax']):9.3f}",
                 fmt_pair_sci(float(kd["min"]), float(kd["max"]), prec=1),
                 fmt_pair_sci(float(wd["min"]), float(wd["max"]), prec=1),
@@ -970,18 +1403,30 @@ def solve_rans_kw(
                 "iter": step,
                 "dt": current_dt,
                 "residual": residual,
-                "umax": float(ud["umax"]),
+                "res_u": res_u,
+                "res_k": res_k,
+                "res_w": res_w,
+                "U_bulk": U_bulk,
+                "tau_wall": tau_wall,
+                "u_max": float(ud["umax"]),
                 "k_min": float(kd["min"]),
                 "k_max": float(kd["max"]),
                 "omega_min": float(wd["min"]),
                 "omega_max": float(wd["max"]),
-                "nu_t_max_ratio": nu_t_ratio,
+                "nu_t_nu_max": nu_t_ratio,
             })
 
-        # Save snapshot
-        if vtx_vel is not None and step % solve.snapshot_interval == 0:
+        # VTX snapshots (ADIOS2 for ParaView)
+        if vtx_vel is not None and do_snapshot:
             vtx_vel.write(t)
             vtx_turb.write(t)
+
+        # PNG plots — decoupled from VTX
+        if do_snapshot and comm.rank == 0:
+            # Residual history: single file, overwritten each time
+            _plot_convergence_live(results_dir / "history.csv", results_dir / "convergence.png")
+            # Flow fields: numbered files (fields_00500.png, etc.)
+            _plot_fields_live(u_, p_, k_, omega_, nu_t_, domain, geom, Re_tau, step, results_dir / "fields.png")
 
         # Convergence check
         if residual < solve.steady_tol:
