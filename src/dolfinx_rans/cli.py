@@ -61,7 +61,7 @@ Environment:
     # Parse config sections
     geom = dc_from_dict(ChannelGeom, cfg["geom"], name="geom")
     turb = dc_from_dict(TurbParams, cfg["turb"], name="turb")
-    solve = SolveParams.from_dict(cfg["solve"])
+    solve = dc_from_dict(SolveParams, cfg["solve"], name="solve")
     nondim = dc_from_dict(NondimParams, cfg["nondim"], name="nondim")
 
     Re_tau = nondim.Re_tau
@@ -112,13 +112,14 @@ Environment:
     # Compute U_bulk (MPI collective - all ranks must call)
     U_bulk = compute_bulk_velocity(u, geom.Lx, geom.Ly)
 
-    if domain.comm.rank == 0:
-        ud = diagnostics_vector(u)
-        pd = diagnostics_scalar(p)
-        kd = diagnostics_scalar(k)
-        wd = diagnostics_scalar(omega)
-        nutd = diagnostics_scalar(nu_t)
+    # MPI collectives — all ranks must participate
+    ud = diagnostics_vector(u)
+    pd = diagnostics_scalar(p)
+    kd = diagnostics_scalar(k)
+    wd = diagnostics_scalar(omega)
+    nutd = diagnostics_scalar(nu_t)
 
+    if domain.comm.rank == 0:
         print("\n" + "─" * 50)
         print("FINAL SOLUTION SUMMARY")
         print("─" * 50)
