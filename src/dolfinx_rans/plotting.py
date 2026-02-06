@@ -96,20 +96,28 @@ def extract_fields_on_line(funcs, y_values, x_val, domain, comm=None):
     cell_candidates = geometry.compute_collisions_points(bb_tree, points)
     cells = geometry.compute_colliding_cells(domain, cell_candidates, points)
 
-    # Each rank evaluates points in its local cells (others stay 0)
+    # Evaluate at first colliding cell (owned or ghost — CG elements give the
+    # same value regardless). Track which points this rank found so we can
+    # divide by count after allreduce to cancel any double-counting at
+    # partition boundaries.
     all_values = [np.zeros(len(y_values)) for _ in funcs]
+    found = np.zeros(len(y_values))
     for i, point in enumerate(points):
         if len(cells.links(i)) > 0:
             cell = cells.links(i)[0]
+            found[i] = 1.0
             for j, func in enumerate(funcs):
                 # DOLFINx Function.eval — FE interpolation at point (not Python eval)
                 result = func.eval(point, cell)  # noqa: S307
                 all_values[j][i] = result[0]
 
-    # MPI reduction: each point is owned by exactly one rank, so SUM = correct value
+    # MPI reduction with count-based averaging to handle double-counting
     if comm is not None:
+        global_found = comm.allreduce(found, op=MPI.SUM)
+        mask = global_found > 0
         for j in range(len(funcs)):
             all_values[j] = comm.allreduce(all_values[j], op=MPI.SUM)
+            all_values[j][mask] /= global_found[mask]
 
     return all_values
 
