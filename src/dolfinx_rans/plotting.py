@@ -12,46 +12,42 @@ from mpi4py import MPI
 
 
 def plot_mesh(domain, geom, save_path: Path | None = None):
-    """Plot the mesh with wall refinement highlighted."""
-    if MPI.COMM_WORLD.rank != 0:
-        return
+    """Plot the mesh with wall refinement highlighted.
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    MPI-safe: all ranks participate in gathering cell data, only rank 0 plots.
+    """
+    comm = domain.comm
 
-    # Get mesh coordinates and topology
+    # Phase 1: gather mesh cells to rank 0 (ALL ranks)
     coords = domain.geometry.x
     cells = domain.geometry.dofmap
+    # Build polygon vertices per cell (local)
+    local_polys = [coords[cell, :2].copy() for cell in cells]
+    all_polys = comm.gather(local_polys, root=0)
 
-    # Left: Full mesh
-    ax = axes[0]
-    for cell in cells:
-        pts = coords[cell]
-        poly = plt.Polygon(pts[:, :2], fill=False, edgecolor="k", linewidth=0.3)
-        ax.add_patch(poly)
+    # Phase 2: plot (rank 0 only)
+    if comm.rank != 0:
+        return
+
+    polys = [p for rank_polys in all_polys for p in rank_polys]
+    ar = geom.Lx / geom.Ly  # aspect ratio
+    fig_w = 14
+    fig_h = fig_w / ar + 1.2  # match geometry + room for title/labels
+
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    for pts in polys:
+        ax.add_patch(plt.Polygon(pts, fill=False, edgecolor="k", linewidth=0.3))
     ax.set_xlim(0, geom.Lx)
     ax.set_ylim(0, geom.Ly)
     ax.set_aspect("equal")
     ax.set_xlabel("x")
     ax.set_ylabel("y")
-    ax.set_title(f"Full mesh ({geom.Nx}×{geom.Ny} {geom.mesh_type}s)")
-
-    # Right: Zoom near wall
-    ax = axes[1]
-    for cell in cells:
-        pts = coords[cell]
-        poly = plt.Polygon(pts[:, :2], fill=False, edgecolor="k", linewidth=0.5)
-        ax.add_patch(poly)
-    ax.set_xlim(0, geom.Lx / 4)
-    ax.set_ylim(0, 0.15)  # Zoom to near-wall region
-    ax.set_aspect("equal")
-    ax.set_xlabel("x")
-    ax.set_ylabel("y")
-    ax.set_title(f"Near-wall refinement (y_first={geom.y_first:.4f})")
+    ax.set_title(f"{geom.Nx}×{geom.Ny} {geom.mesh_type}s  (y_first={geom.y_first:.4f}, growth={geom.growth_rate})")
 
     plt.tight_layout()
 
     if save_path:
-        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
         print(f"  Saved mesh plot: {save_path}")
     plt.close(fig)
 
@@ -266,7 +262,11 @@ def plot_final_fields(u, p, k, omega, nu_t, domain, geom, Re_tau, save_path: Pat
         return
 
     nu = 1.0 / Re_tau
-    fig, axes = plt.subplots(3, 3, figsize=(16, 12))
+    ar = geom.Lx / geom.Ly  # channel aspect ratio (~6.28)
+    # Contour row height adapts to true geometry; profile rows are fixed
+    contour_h = 16 / (3 * ar)  # width per panel / aspect ratio
+    fig, axes = plt.subplots(3, 3, figsize=(16, contour_h + 8),
+                             gridspec_kw={"height_ratios": [contour_h, 4, 4]})
 
     # --- Row 0: 2D contour plots ---
     _tricontour(axes[0, 0], ux_x, ux_y, ux_vals, "u⁺", geom)
@@ -357,13 +357,13 @@ def plot_final_fields(u, p, k, omega, nu_t, domain, geom, Re_tau, save_path: Pat
 
 
 def _tricontour(ax, x, y, vals, label, geom, n_levels=32):
-    """Helper for tricontourf with safe level handling."""
+    """Helper for tricontourf with safe level handling and correct aspect ratio."""
     vmin, vmax = np.min(vals), np.max(vals)
     if vmax - vmin < 1e-15:
         vmax = vmin + 1e-10  # Avoid zero-range levels (e.g., early iterations)
     levels = np.linspace(vmin, vmax, n_levels)
     tcf = ax.tricontourf(x, y, vals, levels=levels, cmap="viridis")
-    ax.set_aspect("auto")
+    ax.set_aspect("equal")
     ax.set_xlabel("x")
     ax.set_ylabel("y")
     ax.set_title(label)

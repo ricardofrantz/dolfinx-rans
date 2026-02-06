@@ -516,7 +516,10 @@ def _plot_fields_live(u, p, k, omega, nu_t, domain, geom, Re_tau, step, save_pat
         return
 
     y_plus = y_vals * Re_tau
-    fig, axes = plt.subplots(3, 3, figsize=(16, 11))
+    ar = geom.Lx / geom.Ly  # channel aspect ratio (~6.28)
+    contour_h = 16 / (3 * ar)  # width per panel / aspect ratio
+    fig, axes = plt.subplots(3, 3, figsize=(16, contour_h + 8),
+                             gridspec_kw={"height_ratios": [contour_h, 4, 4]})
 
     try:
         # --- Row 0: 2D contour plots ---

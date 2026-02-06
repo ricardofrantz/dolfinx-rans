@@ -8,10 +8,10 @@
     "Lx": 6.28,
     "Ly": 1.0,
     "Nx": 48,
-    "Ny": 32,
+    "Ny": 64,
     "mesh_type": "quad",
     "y_first": 0.002,
-    "growth_rate": 1.1,
+    "growth_rate": 1.05,
     "use_symmetry": true,
     "_comment": "Half-channel [0,δ] with symmetry at top. Ly=δ=1, Ny halved."
   },
