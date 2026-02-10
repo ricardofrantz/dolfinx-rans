@@ -915,8 +915,13 @@ def solve_rans_kw(
     bc_walls_u = dirichletbc(u_noslip, wall_dofs_V_tb, V)
 
     # Build velocity BCs list
-    if geom.use_symmetry:
-        # Add symmetry BC at top: v=0 (y-component only) for the solve loop
+    if use_periodic:
+        # Use original-space BC objects with MPC assembly in periodic mode.
+        # Avoid reduced-space subspace dof location, which is unstable in MPI here.
+        bcu = bcs_u0
+    elif geom.use_symmetry:
+        # Add symmetry BC at top: v=0 (y-component only) for non-periodic solve loop.
+        # DOLFINx 0.10.0 requires Function on collapsed subspace for subspace BC
         V_y_sub = V.sub(1)
         V_y_collapsed, _ = V_y_sub.collapse()
         zero_vy_solve = Function(V_y_collapsed)
