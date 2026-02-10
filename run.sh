@@ -179,5 +179,58 @@ else
     python -m dolfinx_rans "$CONFIG"
 fi
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Post-run regression check (Re_τ = 590 reference case)
+# ─────────────────────────────────────────────────────────────────────────────
+python - <<PY || exit 1
+import csv
+import json
+import sys
+from pathlib import Path
+
+cfg = json.loads(Path("$CONFIG").read_text())
+re_tau = float(cfg["nondim"]["Re_tau"])
+if abs(re_tau - 590.0) > 1e-12:
+    print(f"Skipping regression gate (Re_τ={re_tau:g}, gate targets Re_τ=590).")
+    sys.exit(0)
+
+out_dir = Path(cfg["solve"]["out_dir"])
+history = out_dir / "history.csv"
+if not history.exists():
+    print(f"ERROR: Regression gate failed: missing history file {history}")
+    sys.exit(1)
+
+with history.open() as f:
+    rows = list(csv.DictReader(f))
+if not rows:
+    print(f"ERROR: Regression gate failed: empty history file {history}")
+    sys.exit(1)
+
+last = rows[-1]
+u_bulk = float(last["U_bulk"])
+tau_wall = float(last["tau_wall"])
+
+u_bounds = (14.0, 18.0)
+tau_bounds = (0.90, 1.10)
+
+violations = []
+if not (u_bounds[0] <= u_bulk <= u_bounds[1]):
+    violations.append(f"U_bulk={u_bulk:.4f} not in [{u_bounds[0]:.2f}, {u_bounds[1]:.2f}]")
+if not (tau_bounds[0] <= tau_wall <= tau_bounds[1]):
+    violations.append(f"tau_wall={tau_wall:.4f} not in [{tau_bounds[0]:.2f}, {tau_bounds[1]:.2f}]")
+
+if violations:
+    print("ERROR: Regression gate failed:")
+    for v in violations:
+        print(f"  - {v}")
+    print(f"  Source row: iter={last.get('iter', '?')}, dt={last.get('dt', '?')}")
+    sys.exit(1)
+
+print(
+    "Regression gate passed: "
+    f"U_bulk={u_bulk:.4f}, tau_wall={tau_wall:.4f}"
+)
+PY
+
 echo "───────────────────────────────────────────────────────────────────────"
 echo "Done! Check results in the output directory specified in config."
