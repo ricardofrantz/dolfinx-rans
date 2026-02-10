@@ -157,6 +157,7 @@ class ChannelGeom:
     mesh_type: str  # "triangle" or "quad"
     y_first: float  # First cell height from wall (for y+ control)
     growth_rate: float  # Geometric stretching ratio (>1 for wall refinement)
+    y_first_tol_rel: float = 0.05  # Hard-fail if implied y_first differs by more than this
     use_symmetry: bool = True  # Half-channel with symmetry BC at top (default: True)
 
 
@@ -249,6 +250,8 @@ def create_channel_mesh(geom: ChannelGeom, Re_tau: float = None):
         Re_tau: Friction Reynolds number (for y+ reporting)
     """
     comm = MPI.COMM_WORLD
+    if geom.y_first_tol_rel < 0:
+        raise ValueError(f"geom.y_first_tol_rel must be >= 0, got {geom.y_first_tol_rel}")
 
     if geom.growth_rate > 1.0 and geom.y_first > 0:
         # Wall-refined mesh with geometric stretching
@@ -271,6 +274,15 @@ def create_channel_mesh(geom: ChannelGeom, Re_tau: float = None):
 
         # Report first off-wall spacing actually used by the stretched mesh
         y_first_actual = float(y_coords[1] - y_coords[0])
+        rel_err = abs(y_first_actual - geom.y_first) / max(abs(geom.y_first), 1e-16)
+        if rel_err > geom.y_first_tol_rel:
+            raise ValueError(
+                "Inconsistent wall spacing settings: "
+                f"requested y_first={geom.y_first:.6e}, implied by (Ly,Ny,growth)={y_first_actual:.6e}, "
+                f"relative error={100.0 * rel_err:.1f}% exceeds tolerance "
+                f"{100.0 * geom.y_first_tol_rel:.1f}%. "
+                "Adjust Ny/growth_rate or set y_first to match the implied spacing."
+            )
 
         # Report y+ at first off-wall point
         if comm.rank == 0 and Re_tau is not None:
@@ -281,12 +293,6 @@ def create_channel_mesh(geom: ChannelGeom, Re_tau: float = None):
                 f"y_first(actual) = {y_first_actual:.6f}, "
                 f"y+_actual = {y_plus_first:.2f}"
             )
-            rel_err = abs(y_first_actual - geom.y_first) / max(abs(geom.y_first), 1e-16)
-            if rel_err > 0.05:
-                print(
-                    "  WARNING: requested y_first and generated mesh spacing differ "
-                    f"by {100.0 * rel_err:.1f}%. Adjust Ny/growth_rate for consistency."
-                )
             if y_plus_first > 2.5:
                 print("  WARNING: y+ > 2.5, low-Re wall BC may be inaccurate")
 
@@ -690,14 +696,14 @@ def solve_rans_kw(
 
     y_first_cfg = geom.y_first
     y_first = infer_first_offwall_spacing(domain, Ly, geom.use_symmetry)
-    if comm.rank == 0 and y_first_cfg > 0:
+    if y_first_cfg > 0:
         rel_err = abs(y_first - y_first_cfg) / y_first_cfg
-        if rel_err > 0.05:
-            print(
-                "WARNING: y_first mismatch affects wall ω BC: "
-                f"requested={y_first_cfg:.6f}, mesh={y_first:.6f} "
-                f"({100.0 * rel_err:.1f}% difference)",
-                flush=True,
+        if rel_err > geom.y_first_tol_rel:
+            raise ValueError(
+                "Mesh/BC inconsistency at solve stage: "
+                f"requested y_first={y_first_cfg:.6e}, measured from mesh={y_first:.6e}, "
+                f"relative error={100.0 * rel_err:.1f}% exceeds tolerance "
+                f"{100.0 * geom.y_first_tol_rel:.1f}%."
             )
     omega_wall_val = 6.0 * nu / (BETA_0 * y_first**2)
 
