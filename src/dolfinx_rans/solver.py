@@ -1010,7 +1010,7 @@ def solve_rans_kw(
         + D_w * inner(grad(w_trial), grad(phi_w)) * dx
         + beta_c * omega_safe * w_trial * phi_w * dx
         - P_omega * phi_w * dx
-        + cross_diff * phi_w * dx  # Cross-diffusion (positive = increases ω)
+        - cross_diff * phi_w * dx  # Cross-diffusion is a source term on RHS
     )
 
     a_w = form(lhs(F_w))
