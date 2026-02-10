@@ -33,6 +33,7 @@ from dolfinx_rans.plotting import (
     plot_mesh,
     plot_final_fields,
     plot_convergence,
+    write_channel_profile_csv,
 )
 
 
@@ -43,8 +44,8 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    dolfinx-rans channel_re590.json
-    dolfinx-rans --print-only channel_re590.json
+    dolfinx-rans channel_nek_re125k_like.json
+    dolfinx-rans --print-only channel_nek_re125k_like.json
 
 Environment:
     Requires DOLFINx 0.10.0+ and dolfinx_mpc for periodic BCs.
@@ -103,6 +104,10 @@ Environment:
 
     # Plot final results
     plot_final_fields(u, p, k, omega, nu_t, domain, geom, Re_tau, save_path=results_dir / "final_fields.png")
+    write_channel_profile_csv(
+        u, k, omega, nu_t, domain, geom, Re_tau,
+        save_path=results_dir / "profiles.csv",
+    )
 
     # Plot convergence history
     history_file = results_dir / "history.csv"

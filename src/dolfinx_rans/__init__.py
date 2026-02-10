@@ -2,7 +2,7 @@
 dolfinx-rans: RANS turbulence models for DOLFINx.
 
 A FEniCSx-based implementation of Reynolds-Averaged Navier-Stokes
-turbulence models for channel flow validation.
+turbulence models for channel-flow benchmarking.
 
 Requirements:
     - DOLFINx 0.10.0+

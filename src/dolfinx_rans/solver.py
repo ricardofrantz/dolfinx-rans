@@ -6,7 +6,8 @@ Standard k-ω model with:
 - Adaptive time stepping with hysteresis
 - Wall-refined mesh with geometric stretching
 - Optional Durbin realizability limiter
-- Validation against MKM DNS (Re_τ = 180, 590)
+- High-Re benchmark workflow (Nek5000-style periodic channel)
+- Optional legacy DNS cross-checks (Re_τ = 180, 590)
 
 GOVERNING EQUATIONS (NONDIMENSIONAL)
 ====================================
@@ -30,8 +31,8 @@ k: Dirichlet k = 0
 
 REFERENCE
 =========
-DNS: Moser, Kim, Mansour (1999) "DNS of turbulent channel flow up to Re_τ=590"
-     Physics of Fluids, 11(4):943-945. DOI: 10.1063/1.869966
+Nek5000 RANS tutorial: https://nek5000.github.io/NekDoc/tutorials/rans.html
+Legacy DNS reference: Moser, Kim, Mansour (1999), Phys. Fluids 11(4):943-945
 """
 
 from dataclasses import dataclass
@@ -179,7 +180,7 @@ class TurbParams:
     nu_t_max_factor: Max ν_t/ν ratio for stability
     omega_min: Floor on ω to prevent ν_t runaway (10 = best for U+)
     k_min: Floor on k for positivity (1e-10)
-    k_max: Cap on k for safety (DNS k+_max ≈ 5)
+    k_max: Cap on k for safety
     C_lim: Durbin realizability ν_t ≤ C_lim·k/(√6·|S|) (0 = disabled, SST uses internal limiter)
     """
 

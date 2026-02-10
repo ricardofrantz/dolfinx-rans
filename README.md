@@ -6,7 +6,7 @@
 [![DOLFINx](https://img.shields.io/badge/DOLFINx-0.10.0+-green.svg)](https://fenicsproject.org/)
 [![Python](https://img.shields.io/badge/Python-3.11+-yellow.svg)](https://python.org/)
 
-A finite element implementation of the standard k-ω two-equation turbulence model for solving Reynolds-Averaged Navier-Stokes (RANS) equations. Validated against DNS data for turbulent channel flow.
+A finite element implementation of the standard k-ω two-equation turbulence model for solving Reynolds-Averaged Navier-Stokes (RANS) equations. Primary validation workflow is high-Re RANS benchmarking (Nek5000-style channel setup), with Re_τ=590 DNS retained as a legacy secondary check.
 
 ## Table of Contents
 
@@ -31,11 +31,11 @@ A finite element implementation of the standard k-ω two-equation turbulence mod
 # Activate FEniCSx environment
 conda activate fenicsx
 
-# Run solver with config file
-dolfinx-rans examples/channel_re590.json
+# Primary high-Re benchmark case (Nek-like setup)
+dolfinx-rans examples/channel_nek_re125k_like.json
 
-# Quick smoke test (fewer iterations)
-dolfinx-rans examples/channel_smoke.json
+# Legacy low-Re case (secondary check only)
+dolfinx-rans examples/channel_re590.json
 ```
 
 ## Features
@@ -46,7 +46,8 @@ dolfinx-rans examples/channel_smoke.json
 - **Wall-refined mesh** with geometric stretching for proper y⁺ control
 - **Optional Durbin realizability limiter** for stagnation regions
 - **Periodic boundary conditions** via dolfinx_mpc
-- **MKM DNS validation data** (Re_τ = 180, 590) included
+- **Profile CSV export** for cross-code benchmark comparison (`profiles.csv`)
+- **Config-driven regression gates** (bulk, wall shear, optional profile RMSE)
 
 ```
   Turbulent Channel Flow Setup (nondimensional)
@@ -139,13 +140,13 @@ MPC modifies the stiffness matrix to enforce `u_right = u_left` as algebraic con
 | Approach | Pros/Cons |
 |----------|-----------|
 | **Inlet/outlet BCs** | ✗ Unknown inlet profile, entrance effects, long domain needed |
-| **Periodic + body force** | ✓ Body force f_x = 1 drives flow, short domain sufficient, clean DNS comparison |
+| **Periodic + body force** | ✓ Body force f_x = 1 drives fully developed channel, short domain sufficient, clean cross-code RANS comparison |
 
 </details>
 
 ## Configuration
 
-All parameters are **required** in the JSON config file. No hardcoded defaults.
+Core sections (`geom`, `nondim`, `turb`, `solve`) are required. `benchmark` is optional and enables regression/comparison gates.
 
 ### `geom` — Channel Geometry
 
@@ -158,14 +159,15 @@ All parameters are **required** in the JSON config file. No hardcoded defaults.
 | `mesh_type` | `"triangle"` or `"quad"` |
 | `y_first` | First cell height. For low-Re BCs: y+ = y_first × Re_τ < 2.5 |
 | `growth_rate` | Geometric stretching (>1 for wall refinement, 1 for uniform) |
+| `y_first_tol_rel` | Relative tolerance for mesh/BC consistency check (hard fail if exceeded) |
 
 **Wall Refinement:**
 ```
-For Re_τ = 590, need y+ < 2.5:
-    y_first < 2.5 / 590 = 0.00424
+For Re_τ = 5200 (high-Re wall-resolved target), need y+ < 2.5:
+    y_first < 2.5 / 5200 = 4.81e-4
 
-With y_first = 0.002 and growth_rate = 1.1:
-    y+ ≈ 1.18 ✓
+With y_first ≈ 4.66e-4:
+    y+ ≈ 2.43 ✓
 ```
 
 ### `nondim` — Nondimensional Scaling
@@ -205,16 +207,30 @@ With y_first = 0.002 and growth_rate = 1.1:
 | `snapshot_interval` | Save VTX every N iterations (0 = disabled) |
 | `out_dir` | Output directory |
 
+### `benchmark` — Optional Regression/Comparison Gates
+
+| Parameter | Description |
+|-----------|-------------|
+| `gate_u_bulk_bounds` | `[min, max]` gate for `U_bulk` from last history row |
+| `gate_tau_wall_bounds` | `[min, max]` gate for wall shear `τ_wall` |
+| `reference_profile_csv` | Optional Nek reference CSV (columns: `y_plus,u_plus[,k_plus]`) |
+| `u_plus_rmse_max` | Optional max RMSE for `u_plus` vs reference profile |
+| `k_plus_rmse_max` | Optional max RMSE for `k_plus` vs reference profile |
+
 ## Validation
 
-Validated against MKM DNS (Moser, Kim, Mansour 1999) at Re_τ = 590:
+Primary target is **high-Re RANS benchmarking**, aligned with Nek5000-style channel setups, not low-Re DNS matching.
 
-| Metric | RANS k-ω | DNS | Notes |
-|--------|----------|-----|-------|
-| U_c+ | ~20-24 | 23.56 | ~±10% |
-| k+_max | ~1-2 | 3.13 | Model limitation |
+Recommended workflow:
+1. Run this solver with `examples/channel_nek_re125k_like.json`.
+2. Run Nek5000 RANS channel tutorial case (or your house RANS baseline) at matching conditions.
+3. Export/reference a profile CSV with `y_plus,u_plus[,k_plus]`.
+4. Set `benchmark.reference_profile_csv` and RMSE thresholds in your config.
+5. Re-run with `./run.sh` and use the built-in regression gate output.
 
-**Known limitation:** Standard k-ω under-predicts TKE in channel core. This is well-documented in turbulence modeling literature. SST k-ω would improve k prediction.
+Notes:
+- This solver now writes `profiles.csv` for every run.
+- Legacy Re_τ=590/DNS comparisons are still possible via `examples/channel_re590.json`, but are secondary checks.
 
 ## Python API
 
@@ -223,7 +239,6 @@ from dolfinx_rans import (
     ChannelGeom, NondimParams, TurbParams, SolveParams,
     create_channel_mesh, solve_rans_kw
 )
-from dolfinx_rans.validation import get_k_profile_590, MEAN_VELOCITY_590
 
 # Create mesh
 geom = ChannelGeom(Lx=6.28, Ly=2.0, Nx=48, Ny=64,
@@ -234,16 +249,14 @@ domain = create_channel_mesh(geom, Re_tau=590)
 u, p, k, omega, nu_t, V, Q, S, domain, step, t = solve_rans_kw(
     domain, geom, turb, solve, results_dir, nondim
 )
-
-# Compare to DNS
-y_plus_dns, k_plus_dns = get_k_profile_590()
 ```
 
 ## Output
 
 Results saved to `out_dir`:
-- `flow_fields.png` — Contour plots
+- `final_fields.png` — Contour plots and profiles
 - `history.csv` — Convergence history
+- `profiles.csv` — Wall-normal benchmark profile (`y_plus,u_plus,k_plus,...`)
 - `config_used.json` — Config snapshot
 - `run_info.json` — Environment metadata
 - `snps/*.bp` — VTX time series (ParaView)
@@ -379,14 +392,15 @@ where ν* = 1/Re_τ, f_x = 1
 2. Menter (1994) "Two-Equation Eddy-Viscosity Turbulence Models for Engineering Applications" *AIAA J.* 32(8):1598-1605 — SST model
 3. Durbin (1996) "On the k-ε stagnation point anomaly" *Int. J. Heat Fluid Flow* 17:89-90
 
-### Validation Data
-4. Moser, Kim, Mansour (1999) "DNS of turbulent channel flow up to Re_τ=590" *Phys. Fluids* 11(4):943-945
-5. [Johns Hopkins Turbulence Database](http://turbulence.pha.jhu.edu/) — DNS data repository
+### Benchmark/Reference Cases
+4. [Nek5000 RANS Tutorial (periodic channel)](https://nek5000.github.io/NekDoc/tutorials/rans.html) — high-Re RANS setup and model options
+5. Moser, Kim, Mansour (1999) "DNS of turbulent channel flow up to Re_τ=590" *Phys. Fluids* 11(4):943-945 (legacy low-Re cross-check)
+6. [Johns Hopkins Turbulence Database](http://turbulence.pha.jhu.edu/) — DNS data repository
 
 ### FEM Implementation
-6. Carrier et al. (2021) "Finite element implementation of k−ω SST with automatic wall treatment" *Int. J. Numer. Methods Fluids* 93:3598-3627
-7. Codina (1998) "Comparison of some finite element methods for solving the diffusion-convection-reaction equation" *Comput. Methods Appl. Mech. Eng.* 156:185-210
-8. [FEniCS Book](https://fenicsproject.org/pub/book/book/fenics-book-2011-06-14.pdf) — Automated Solution of Differential Equations by the Finite Element Method
+7. Carrier et al. (2021) "Finite element implementation of k−ω SST with automatic wall treatment" *Int. J. Numer. Methods Fluids* 93:3598-3627
+8. Codina (1998) "Comparison of some finite element methods for solving the diffusion-convection-reaction equation" *Comput. Methods Appl. Mech. Eng.* 156:185-210
+9. [FEniCS Book](https://fenicsproject.org/pub/book/book/fenics-book-2011-06-14.pdf) — Automated Solution of Differential Equations by the Finite Element Method
 
 ### Online Resources
 - [CFD-Wiki: k-omega models](https://www.cfd-online.com/Wiki/SST_k-omega_model)

@@ -148,6 +148,46 @@ def gather_scalar_field(func, comm):
     return None, None, None
 
 
+def write_channel_profile_csv(u, k, omega, nu_t, domain, geom, Re_tau, save_path: Path, n_points: int = 256):
+    """
+    Export centerline-normalized channel profiles for benchmark comparison.
+
+    Output columns:
+      y, y_plus, u_plus, k_plus, omega_plus, nu_t_over_nu
+    """
+    comm = domain.comm
+
+    # Avoid sampling exactly on boundaries for robust point evaluation.
+    eps = min(1e-6, max(1e-10, 0.1 * geom.y_first))
+    if 2.0 * eps >= geom.Ly:
+        eps = 1e-10
+
+    y_vals = np.linspace(eps, geom.Ly - eps, n_points)
+    x_mid = geom.Lx / 2.0
+
+    u_profile, k_profile, omega_profile, nu_t_profile = extract_fields_on_line(
+        [u.sub(0), k, omega, nu_t], y_vals, x_mid, domain, comm=comm,
+    )
+
+    if comm.rank != 0:
+        return
+
+    nu = 1.0 / Re_tau
+    y_plus = y_vals * Re_tau
+    nu_t_over_nu = nu_t_profile / nu
+
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    data = np.column_stack([y_vals, y_plus, u_profile, k_profile, omega_profile, nu_t_over_nu])
+    np.savetxt(
+        save_path,
+        data,
+        delimiter=",",
+        header="y,y_plus,u_plus,k_plus,omega_plus,nu_t_over_nu",
+        comments="",
+    )
+    print(f"  Saved profile CSV: {save_path}")
+
+
 def plot_initial_conditions(u, p, k, omega, nu_t, domain, geom, Re_tau, save_path: Path | None = None):
     """Plot initial condition fields.
 

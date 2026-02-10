@@ -1,5 +1,5 @@
 """
-DNS validation data for turbulent channel flow.
+Legacy DNS reference data for turbulent channel flow.
 
 Data from Moser, Kim, Mansour (1999) "DNS of turbulent channel flow up to Re_τ=590"
 Physics of Fluids, 11(4):943-945. DOI: 10.1063/1.869966
