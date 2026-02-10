@@ -269,10 +269,24 @@ def create_channel_mesh(geom: ChannelGeom, Re_tau: float = None):
             if comm.rank == 0:
                 print(f"Full channel (walls at y=0 and y={Ly:.2f})")
 
-        # Report y+ at first cell
+        # Report first off-wall spacing actually used by the stretched mesh
+        y_first_actual = float(y_coords[1] - y_coords[0])
+
+        # Report y+ at first off-wall point
         if comm.rank == 0 and Re_tau is not None:
-            y_plus_first = geom.y_first * Re_tau
-            print(f"Wall-refined mesh: y_first = {geom.y_first:.6f}, y+ = {y_plus_first:.2f}")
+            y_plus_first = y_first_actual * Re_tau
+            print(
+                "Wall-refined mesh: "
+                f"y_first(requested) = {geom.y_first:.6f}, "
+                f"y_first(actual) = {y_first_actual:.6f}, "
+                f"y+_actual = {y_plus_first:.2f}"
+            )
+            rel_err = abs(y_first_actual - geom.y_first) / max(abs(geom.y_first), 1e-16)
+            if rel_err > 0.05:
+                print(
+                    "  WARNING: requested y_first and generated mesh spacing differ "
+                    f"by {100.0 * rel_err:.1f}%. Adjust Ny/growth_rate for consistency."
+                )
             if y_plus_first > 2.5:
                 print("  WARNING: y+ > 2.5, low-Re wall BC may be inaccurate")
 
@@ -309,10 +323,8 @@ def _generate_stretched_coords(y_first: float, H: float, N: int, growth: float) 
     """
     Generate geometrically stretched y-coordinates from wall to midplane.
 
-    Note: The actual first cell size is computed to exactly fill H with N cells
-    using the given growth rate. The y_first parameter from config is used for
-    y+ reporting and wall BC calculation, but the mesh generator computes its
-    own first cell size from the geometric constraint.
+    Note: With fixed (H, N, growth), the first spacing is determined by the
+    geometric-series closure and can differ from the requested y_first value.
     """
     if growth == 1.0:
         return np.linspace(0, H, N + 1)
@@ -387,6 +399,27 @@ def mark_boundaries(domain, Lx: float, Ly: float):
     left_facets = mesh.locate_entities_boundary(domain, fdim, left)
     right_facets = mesh.locate_entities_boundary(domain, fdim, right)
     return bottom_facets, top_facets, left_facets, right_facets
+
+
+def infer_first_offwall_spacing(domain, Ly: float, use_symmetry: bool, tol: float = 1e-12) -> float:
+    """
+    Infer first off-wall spacing directly from mesh coordinates.
+
+    For half-channel this is min(y > 0).
+    For full channel this is min(min(y, Ly-y) > 0).
+    """
+    y = domain.geometry.x[:, 1]
+    if use_symmetry:
+        wall_distance = y
+    else:
+        wall_distance = np.minimum(y, Ly - y)
+
+    positive = wall_distance[wall_distance > tol]
+    local_min = float(np.min(positive)) if positive.size > 0 else np.inf
+    y_first = float(domain.comm.allreduce(local_min, op=MPI.MIN))
+    if not np.isfinite(y_first):
+        raise RuntimeError("Could not infer first off-wall spacing from mesh geometry.")
+    return y_first
 
 
 # =============================================================================
@@ -655,7 +688,17 @@ def solve_rans_kw(
     # Boundary facets
     bottom_facets, top_facets, left_facets, right_facets = mark_boundaries(domain, geom.Lx, Ly)
 
-    y_first = geom.y_first
+    y_first_cfg = geom.y_first
+    y_first = infer_first_offwall_spacing(domain, Ly, geom.use_symmetry)
+    if comm.rank == 0 and y_first_cfg > 0:
+        rel_err = abs(y_first - y_first_cfg) / y_first_cfg
+        if rel_err > 0.05:
+            print(
+                "WARNING: y_first mismatch affects wall ω BC: "
+                f"requested={y_first_cfg:.6f}, mesh={y_first:.6f} "
+                f"({100.0 * rel_err:.1f}% difference)",
+                flush=True,
+            )
     omega_wall_val = 6.0 * nu / (BETA_0 * y_first**2)
 
     if geom.use_symmetry:
@@ -891,7 +934,11 @@ def solve_rans_kw(
     bcw = [bc_w_wall]
 
     if comm.rank == 0:
-        print(f"Wall ω BC: ω_wall = {omega_wall_val:.2e} (y_first = {y_first})", flush=True)
+        print(
+            f"Wall ω BC: ω_wall = {omega_wall_val:.2e} "
+            f"(y_first mesh = {y_first:.6f}, requested = {y_first_cfg:.6f})",
+            flush=True,
+        )
         print("Setting up weak forms...", flush=True)
 
     comm.barrier()  # Sync before form setup
@@ -1338,9 +1385,10 @@ def solve_rans_kw(
                 # Wilcox 2006: ν_t = k/ω̃ where ω̃ = max(ω, C_lim·|S|/√β*)
                 # =======================================================
                 omega_tilde = np.maximum(
-                    omega_.x.array + omega_min,
-                    C_lim * S_mag_safe / SQRT_BETA_STAR
+                    omega_.x.array,
+                    C_lim * S_mag_safe / SQRT_BETA_STAR,
                 )
+                omega_tilde = np.maximum(omega_tilde, omega_min)
                 nu_t_raw = k_.x.array / omega_tilde
 
             # Apply limits and under-relaxation (both models)
