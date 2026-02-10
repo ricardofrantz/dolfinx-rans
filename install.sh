@@ -330,12 +330,12 @@ main() {
     echo ""
     echo "Usage:"
     echo "  conda activate $CONDA_ENV"
-    echo "  ./run.sh                    # Run with default config (Re_τ=590)"
+    echo "  ./run.sh                    # Run with default high-Re Nek-like config"
     echo "  ./run.sh 4                  # Run with 4 MPI processes"
     echo "  ./run.sh path/to/config.json # Run with custom config"
     echo ""
     echo "Or directly:"
-    echo "  python -m dolfinx_rans examples/channel_re590.json"
+    echo "  python -m dolfinx_rans examples/channel_nek_re125k_like.json"
     echo ""
 }
 

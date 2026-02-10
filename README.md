@@ -6,7 +6,7 @@
 [![DOLFINx](https://img.shields.io/badge/DOLFINx-0.10.0+-green.svg)](https://fenicsproject.org/)
 [![Python](https://img.shields.io/badge/Python-3.11+-yellow.svg)](https://python.org/)
 
-A finite element implementation of the standard k-ω two-equation turbulence model for solving Reynolds-Averaged Navier-Stokes (RANS) equations. Primary validation workflow is high-Re RANS benchmarking (Nek5000-style channel setup), with Re_τ=590 DNS retained as a legacy secondary check.
+A finite element implementation of the standard k-ω two-equation turbulence model for solving Reynolds-Averaged Navier-Stokes (RANS) equations. Primary validation workflow is high-Re RANS benchmarking (Nek5000-style channel setup).
 
 ## Table of Contents
 
@@ -33,9 +33,6 @@ conda activate fenicsx
 
 # Primary high-Re benchmark case (Nek-like setup)
 dolfinx-rans examples/channel_nek_re125k_like.json
-
-# Legacy low-Re case (secondary check only)
-dolfinx-rans examples/channel_re590.json
 ```
 
 ## Features
@@ -230,7 +227,6 @@ Recommended workflow:
 
 Notes:
 - This solver now writes `profiles.csv` for every run.
-- Legacy Re_τ=590/DNS comparisons are still possible via `examples/channel_re590.json`, but are secondary checks.
 
 ## Python API
 
@@ -344,7 +340,7 @@ Low-Re wall treatment requires first cell in viscous sublayer (y⁺ < 2.5):
 ```
 y⁺ = y·u_τ/ν = y·Re_τ/δ
 
-For Re_τ = 590:  y_first < 2.5/590 ≈ 0.004
+For Re_τ = 5200:  y_first < 2.5/5200 ≈ 4.81e-4
 ```
 
 This forces thin wall cells → high aspect ratios → potential conditioning issues.
@@ -396,13 +392,11 @@ where ν* = 1/Re_τ, f_x = 1
 
 ### Benchmark/Reference Cases
 4. [Nek5000 RANS Tutorial (periodic channel)](https://nek5000.github.io/NekDoc/tutorials/rans.html) — high-Re RANS setup and model options
-5. Moser, Kim, Mansour (1999) "DNS of turbulent channel flow up to Re_τ=590" *Phys. Fluids* 11(4):943-945 (legacy low-Re cross-check)
-6. [Johns Hopkins Turbulence Database](http://turbulence.pha.jhu.edu/) — DNS data repository
 
 ### FEM Implementation
-7. Carrier et al. (2021) "Finite element implementation of k−ω SST with automatic wall treatment" *Int. J. Numer. Methods Fluids* 93:3598-3627
-8. Codina (1998) "Comparison of some finite element methods for solving the diffusion-convection-reaction equation" *Comput. Methods Appl. Mech. Eng.* 156:185-210
-9. [FEniCS Book](https://fenicsproject.org/pub/book/book/fenics-book-2011-06-14.pdf) — Automated Solution of Differential Equations by the Finite Element Method
+5. Carrier et al. (2021) "Finite element implementation of k−ω SST with automatic wall treatment" *Int. J. Numer. Methods Fluids* 93:3598-3627
+6. Codina (1998) "Comparison of some finite element methods for solving the diffusion-convection-reaction equation" *Comput. Methods Appl. Mech. Eng.* 156:185-210
+7. [FEniCS Book](https://fenicsproject.org/pub/book/book/fenics-book-2011-06-14.pdf) — Automated Solution of Differential Equations by the Finite Element Method
 
 ### Online Resources
 - [CFD-Wiki: k-omega models](https://www.cfd-online.com/Wiki/SST_k-omega_model)

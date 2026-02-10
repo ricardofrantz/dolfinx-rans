@@ -7,7 +7,7 @@ Standard k-ω model with:
 - Wall-refined mesh with geometric stretching
 - Optional Durbin realizability limiter
 - High-Re benchmark workflow (Nek5000-style periodic channel)
-- Optional legacy DNS cross-checks (Re_τ = 180, 590)
+- Optional external cross-code profile comparison
 
 GOVERNING EQUATIONS (NONDIMENSIONAL)
 ====================================
@@ -1204,7 +1204,7 @@ def solve_rans_kw(
         )
 
     # Pre-compute loop-invariant values
-    omega_max_limit = 10.0 * omega_wall_val  # ~3.4e+05 for Re_tau=590
+    omega_max_limit = 10.0 * omega_wall_val  # Scale wall-driven cap with current case
     ur_kw = solve.under_relax_k_omega
     alpha_u = 0.7  # velocity under-relaxation factor
 

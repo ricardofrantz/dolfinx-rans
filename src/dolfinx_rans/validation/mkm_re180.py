@@ -3,7 +3,7 @@ MKM DNS data for Re_tau = 180 channel flow.
 
 Reference:
 Moser, R.D., Kim, J., Mansour, N.N. (1999).
-"DNS of turbulent channel flow up to Re_τ = 590"
+"DNS of turbulent channel flow"
 Physics of Fluids, 11(4):943-945.
 
 Data from: https://turbulence.oden.utexas.edu/

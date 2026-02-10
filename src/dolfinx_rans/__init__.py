@@ -11,8 +11,8 @@ Requirements:
 
 Example:
     from dolfinx_rans import ChannelGeom, create_channel_mesh, solve_rans_kw
-    geom = ChannelGeom(Lx=6.28, Ly=2.0, Nx=48, Ny=64, ...)
-    domain = create_channel_mesh(geom, Re_tau=590)
+    geom = ChannelGeom(Lx=1.0, Ly=1.0, Nx=96, Ny=96, ...)
+    domain = create_channel_mesh(geom, Re_tau=5200)
     u, p, k, omega, nu_t, ... = solve_rans_kw(domain, geom, turb, solve, results_dir, nondim)
 """
 

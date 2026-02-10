@@ -69,17 +69,13 @@ case "$CONFIG_ARG" in
         CONFIG="$SCRIPT_DIR/examples/channel_nek_re125k_like.json"
         echo "Running: high-Re Nek-like channel benchmark"
         ;;
-    re590)
-        CONFIG="$SCRIPT_DIR/examples/channel_re590.json"
-        echo "Running: Re_τ=590 channel flow (legacy DNS-oriented case)"
-        ;;
     *.json)
         CONFIG="$CONFIG_ARG"
         echo "Running: Custom config $CONFIG"
         ;;
     *)
         echo "ERROR: Unknown config '$CONFIG_ARG'"
-        echo "Usage: ./run.sh [NPROCS] [nek|re590|path/to/config.json]"
+        echo "Usage: ./run.sh [NPROCS] [nek|path/to/config.json]"
         exit 1
         ;;
 esac
@@ -220,11 +216,6 @@ if isinstance(ref_csv, str) and not ref_csv.strip():
     ref_csv = None
 u_rmse_max = bench.get("u_plus_rmse_max")
 k_rmse_max = bench.get("k_plus_rmse_max")
-
-# Backward-compatible default gate for legacy Re_tau=590 config.
-if u_bounds is None and tau_bounds is None and ref_csv is None and abs(re_tau - 590.0) < 1e-12:
-    u_bounds = (14.0, 18.0)
-    tau_bounds = (0.90, 1.10)
 
 if u_bounds is None and tau_bounds is None and ref_csv is None:
     print("Skipping regression gate (no benchmark thresholds configured).")
