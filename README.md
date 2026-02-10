@@ -240,10 +240,12 @@ from dolfinx_rans import (
     create_channel_mesh, solve_rans_kw
 )
 
-# Create mesh
-geom = ChannelGeom(Lx=6.28, Ly=2.0, Nx=48, Ny=64,
-                   mesh_type="triangle", y_first=0.002, growth_rate=1.1)
-domain = create_channel_mesh(geom, Re_tau=590)
+# Create mesh (high-Re Nek-like benchmark setup)
+geom = ChannelGeom(
+    Lx=1.0, Ly=1.0, Nx=96, Ny=96,
+    mesh_type="quad", y_first=0.000466477, growth_rate=1.05
+)
+domain = create_channel_mesh(geom, Re_tau=5200)
 
 # Run solver
 u, p, k, omega, nu_t, V, Q, S, domain, step, t = solve_rans_kw(
