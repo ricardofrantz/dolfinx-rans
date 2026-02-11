@@ -313,3 +313,150 @@ Rationale:
    - nonzero exit was due to configured regression gate (`tau_wall` threshold), **not** allocator crash
 4. Non-periodic control:
    - `./run.sh 4 /tmp/channel_open_4proc_smoke.json` still exits cleanly
+
+## Structured Rerun In Standard Results Layout (February 10, 2026, late session)
+
+To remove ad-hoc investigation folders and keep artifacts in the normal case layout, the periodic 4-rank benchmark was rerun using:
+
+1. Config file on disk (not `/tmp`): `re5200_nek/run_config.json`
+   - based on `examples/channel_nek_re125k_like.json`
+   - `solve.out_dir = "re5200_nek"`
+   - `solve.snapshot_interval = 200`
+   - `solve.max_iter = 800`
+2. Command:
+   - `./run.sh 4 re5200_nek/run_config.json | tee re5200_nek/run.log`
+
+### Observed Outcome
+
+1. Solver completed full 800 iterations.
+2. No allocator-teardown signatures (`corrupted size`, `free(): invalid size`) in `re5200_nek/run.log`.
+3. Finalization/plotting completed:
+   - `Saved final fields plot: re5200_nek/final_fields.png`
+   - `Results saved to re5200_nek/`
+4. Regression gate still fails on wall shear:
+   - `tau_wall=0.5207` outside configured `[0.90, 1.10]`
+   - This is a physics/threshold issue, not the previous teardown crash.
+
+### Files Now Present Under `re5200_nek/`
+
+- `config_used.json`, `run_info.json`, `history.csv`
+- `mesh.png`, `fields.png`, `fields_00200.png`, `fields_00400.png`, `fields_00600.png`, `fields_00800.png`
+- `final_fields.png`, `convergence.png`, `profiles.csv`
+- `snps/velocity.bp/*`, `snps/turbulence.bp/*`
+- `run.log`
+
+## Extended Convergence Test (Same Mesh) — `re5200_nek_long`
+
+Objective: test whether low `tau_wall` is primarily an iteration-count issue on the existing mesh.
+
+### Config / Command
+
+1. Config: `re5200_nek_long/run_config.json`
+   - based on `examples/channel_nek_re125k_like.json`
+   - `geom`: unchanged (`Nx=96`, `Ny=96`, `growth_rate=1.05`, `y+_actual=2.43`)
+   - `solve.max_iter=2500`
+   - `solve.log_interval=50`
+   - `solve.snapshot_interval=500`
+2. Command:
+   - `./run.sh 4 re5200_nek_long/run_config.json | tee re5200_nek_long/run.log`
+
+### Outcome
+
+1. Completed all 2500 iterations with clean teardown (no allocator crash signatures).
+2. Final checkpoint:
+   - `iter=2500`
+   - `tau_wall=0.6533`
+   - `U_bulk=15.6382`
+   - `residual=3.2e-04`
+3. Regression gate still fails (`tau_wall` below `[0.90, 1.10]`).
+
+### Artifacts
+
+- `re5200_nek_long/run.log`
+- `re5200_nek_long/history.csv`
+- `re5200_nek_long/profiles.csv`
+- `re5200_nek_long/final_fields.png`
+- `re5200_nek_long/convergence.png`
+- `re5200_nek_long/fields_00500.png` ... `fields_02500.png`
+- `re5200_nek_long/snps/*`
+
+## Refined Near-Wall + More Elements Test — `re5200_nek_refined`
+
+Objective: test user hypothesis that SEM-equivalent resolution may require more elements and tighter near-wall spacing in this finite-element setup.
+
+### Config / Command
+
+1. Config: `re5200_nek_refined/run_config.json`
+   - `geom.Nx=192`
+   - `geom.Ny=114`
+   - `geom.growth_rate=1.05`
+   - `geom.y_first=1.9277963481490493e-04` (implied by closure; `y+_actual=1.00`)
+   - `solve.max_iter=1500`
+   - `solve.log_interval=50`
+   - `solve.snapshot_interval=300`
+2. Command:
+   - `./run.sh 4 re5200_nek_refined/run_config.json | tee re5200_nek_refined/run.log`
+
+### Outcome
+
+1. Completed all 1500 iterations with clean teardown (no allocator crash signatures).
+2. Final checkpoint:
+   - `iter=1500`
+   - `tau_wall=0.4700`
+   - `U_bulk=15.5171`
+   - `residual=3.4e-04`
+3. Regression gate still fails (`tau_wall` below `[0.90, 1.10]`).
+4. Compared at equal-ish iteration windows, this refined setup trends to lower `tau_wall` than the coarse setup in the current transient window.
+
+### Artifacts
+
+- `re5200_nek_refined/run.log`
+- `re5200_nek_refined/history.csv`
+- `re5200_nek_refined/profiles.csv`
+- `re5200_nek_refined/final_fields.png`
+- `re5200_nek_refined/convergence.png`
+- `re5200_nek_refined/fields_00300.png` ... `fields_01500.png`
+- `re5200_nek_refined/snps/*`
+
+## Nek Profile Export + Overlay Comparison (from `../nekStab/example/poiseuille_RANS`)
+
+User-requested step: read Nek case data using the local `plot.py` workflow and export profile data for direct comparison.
+
+### Source Case and Access Method
+
+1. Source case path:
+   - `../nekStab/example/poiseuille_RANS`
+2. Script inspected:
+   - `../nekStab/example/poiseuille_RANS/plot.py`
+3. Data access method used (same helper stack as plot script):
+   - `../nekStab/example/nekplot.py`
+   - `nekplot.read_field(...)` on:
+     - `../nekStab/example/poiseuille_RANS/BF_poiseuille_RANS0.f00001`
+
+### Export/Comparison Outputs (all on disk)
+
+Folder: `re5200_nek_compare/`
+
+1. Nek exports:
+   - `nek_profile_outer.csv`
+   - `nek_profile_outer.dat`
+   - `nek_profile_wall_units_assumed.csv`
+2. DOLFINx exports used in overlay:
+   - `re5200_nek_long_outer.csv`
+   - `re5200_nek_refined_outer.csv`
+3. Plots:
+   - `comparison_outer.png`
+   - `comparison_wall_units_assumed.png`
+4. Metadata/assumptions:
+   - `comparison_metadata.json`
+
+### Key Metadata Captured
+
+1. Nek baseflow time from field file: `196.5509840257`
+2. Nek domain extents from field:
+   - `x ∈ [0, 2π]`
+   - `y ∈ [-1, 1]`
+3. Nek outer-scale bulk velocity from extracted profile:
+   - `U_bulk ≈ 0.99849`
+4. Wall-units conversion for Nek marked as approximate:
+   - derived from `poiseuille_RANS.par` viscosity convention (`viscosity=-1e5` interpreted as `Re=1e5`)
