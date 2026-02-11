@@ -460,3 +460,97 @@ Folder: `re5200_nek_compare/`
    - `U_bulk ≈ 0.99849`
 4. Wall-units conversion for Nek marked as approximate:
    - derived from `poiseuille_RANS.par` viscosity convention (`viscosity=-1e5` interpreted as `Re=1e5`)
+
+## Nek Reynolds Traceability (Precision Check Requested)
+
+Direct file evidence used:
+
+1. `../nekStab/example/poiseuille_RANS/poiseuille_RANS.par`
+   - `[VELOCITY] viscosity = -1e5`
+2. `../nekStab/example/poiseuille_RANS/poiseuille_RANS.log.4`
+   - runtime echoes `viscosity = [-1e5]`
+   - runtime parameter line reports `viscosity (1/Re) = 1.0e-5`
+3. `../nekStab/example/poiseuille_RANS/README.md`
+   - states `Re = 10^5` (bulk/half-height wording)
+
+Conclusion:
+- The Nek case is traceably `Re = 100000` by its own input/log convention.
+- `Re_tau = 5200` is **not** from Nek files; it is from this repo’s config `examples/channel_nek_re125k_like.json`.
+
+## Reusable Nek Extraction Script Added
+
+New in-repo script:
+
+- `src/dolfinx_rans/validation/nek_poiseuille_profile.py`
+
+Purpose:
+- Read Nek baseflow field using same helper stack as local Nek plot workflow.
+- Export traceable profile files:
+  - `nek_profile_outer.csv`
+  - `nek_profile_outer.dat`
+  - `nek_profile_wall_units.csv`
+  - `nek_reference_profile.csv` (run.sh-compatible columns: `y_plus,u_plus`)
+- Generate overlays:
+  - `comparison_outer.png`
+  - `comparison_wall_units.png`
+- Write metadata including parsed `Re`, parsed `nu`, and estimated `Re_tau` from extracted wall gradient.
+
+Run performed:
+
+```bash
+PYTHONPATH=src python src/dolfinx_rans/validation/nek_poiseuille_profile.py \
+  --nek-case-dir ../nekStab/example/poiseuille_RANS \
+  --out-dir nek_poiseuille_profile \
+  --dolfinx-profiles re5200_nek_long/profiles.csv re5200_nek_refined/profiles.csv
+```
+
+Result highlights:
+- `Re from par: 100000.0`
+- `Estimated Re_tau from extracted baseflow: 1115.82`
+- artifacts saved under `nek_poiseuille_profile/`
+
+## Full-Channel (No Symmetry) Case With Nek-Linked Reference Gate
+
+User-requested no-symmetry run and direct comparison against local Nek reference profile.
+
+### Config
+
+- `nek_re100k_fullchannel/run_config.json`
+  - `geom.use_symmetry=false`
+  - `geom.Ly=2.0` (full channel)
+  - `nondim.Re_tau=1115.818661288065` (derived from extracted Nek baseflow metadata)
+  - `benchmark.reference_profile_csv=../nek_poiseuille_profile/nek_reference_profile.csv`
+  - `benchmark.u_plus_rmse_max=5.0`
+
+### Important Runtime Note
+
+1. First attempt with stretched full-channel mesh (`growth_rate=1.05`) failed in periodic MPC setup:
+   - `RuntimeError: Newton method failed to converge for non-affine geometry`
+2. Workaround used for successful run:
+   - switched to uniform mesh (`growth_rate=1.0`, `y_first=0.0`)
+   - kept periodic streamwise setup
+
+### Successful Run (Controlled Window)
+
+Command:
+
+```bash
+./run.sh 4 nek_re100k_fullchannel/run_config.json | tee nek_re100k_fullchannel/run.log
+```
+
+Outcome:
+
+1. Completed cleanly to `max_iter=400` (no allocator crash).
+2. Final values at iter 400:
+   - `U_bulk=15.2533`
+   - `tau_wall=0.0983`
+3. Reference-profile gate result:
+   - `u_plus RMSE=74.5987` (fails limit `5.0`)
+
+Artifacts:
+- `nek_re100k_fullchannel/run.log`
+- `nek_re100k_fullchannel/history.csv`
+- `nek_re100k_fullchannel/profiles.csv`
+- `nek_re100k_fullchannel/final_fields.png`
+- `nek_re100k_fullchannel/convergence.png`
+- `nek_re100k_fullchannel/snps/*`
