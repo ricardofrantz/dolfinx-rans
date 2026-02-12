@@ -31,10 +31,10 @@ write_default_re100k_config() {
     "Ly": 2.0,
     "Nx": 192,
     "Ny": 166,
-    "mesh_type": "quad",
-    "y_first": 0.0,
-    "growth_rate": 1.0,
-    "y_first_tol_rel": 1.0,
+    "mesh_type": "triangle",
+    "y_first": 0.001604628,
+    "growth_rate": 1.04,
+    "y_first_tol_rel": 0.2,
     "use_symmetry": false
   },
   "nondim": {
