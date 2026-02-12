@@ -31,8 +31,8 @@ A finite element implementation of the standard k-ω two-equation turbulence mod
 # Activate FEniCSx environment
 conda activate fenicsx
 
-# Primary high-Re benchmark case (Nek-like setup)
-dolfinx-rans examples/channel_nek_re125k_like.json
+# Canonical single-case runner (re100k)
+./run_re100k.sh
 ```
 
 ## Features
@@ -219,11 +219,11 @@ With y_first ≈ 4.66e-4:
 Primary target is **high-Re RANS benchmarking**, aligned with Nek5000-style channel setups, not low-Re DNS matching.
 
 Recommended workflow:
-1. Run this solver with `examples/channel_nek_re125k_like.json`.
+1. Run the canonical case with `./run_re100k.sh`.
 2. Run Nek5000 RANS channel tutorial case (or your house RANS baseline) at matching conditions.
 3. Export/reference a profile CSV with `y_plus,u_plus[,k_plus]`.
 4. Set `benchmark.reference_profile_csv` and RMSE thresholds in your config.
-5. Re-run with `./run.sh` and use the built-in regression gate output.
+5. Re-run with `./run_re100k.sh` and use the built-in regression gate output.
 
 Notes:
 - This solver now writes `profiles.csv` for every run.
