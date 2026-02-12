@@ -37,6 +37,25 @@ from dolfinx_rans.plotting import (
 )
 
 
+def _resolve_reference_profile_csv(cfg: dict, cfg_path: Path) -> Path | None:
+    """Resolve optional reference profile path for final dashed overlays."""
+    bench = dict(cfg.get("benchmark", {}))
+    ref_cfg = bench.get("reference_profile_csv")
+    if isinstance(ref_cfg, str) and ref_cfg.strip():
+        ref_path = Path(ref_cfg)
+        if not ref_path.is_absolute():
+            ref_path = (cfg_path.parent / ref_path).resolve()
+        if ref_path.exists():
+            return ref_path
+        return None
+
+    # Default convenience path for the re100k workflow.
+    auto = (cfg_path.parent.parent / "nek_re100k" / "nek_to_csv.csv").resolve()
+    if auto.exists():
+        return auto
+    return None
+
+
 def main():
     """Run RANS k-ω solver from command line."""
     p = argparse.ArgumentParser(
@@ -89,11 +108,19 @@ Environment:
         print("=" * 60)
         print(f"Mode: NONDIMENSIONAL (Re_τ = {Re_tau})")
         print(f"Scaling: δ = 1, u_τ = 1, ν* = 1/Re_τ = {1.0/Re_tau:.6f}")
-        print(f"Mesh: {geom.Nx}×{geom.Ny} ({geom.mesh_type})")
+        stretch_mode = geom.stretching.lower()
+        if geom.y_first > 0 and (stretch_mode == "tanh" or geom.growth_rate > 1.0):
+            print(f"Mesh: {geom.Nx}×{geom.Ny} ({geom.mesh_type}, {stretch_mode})")
+        else:
+            print(f"Mesh: {geom.Nx}×{geom.Ny} ({geom.mesh_type})")
         print(f"Domain: {geom.Lx:.2f} × {geom.Ly:.2f}")
         print()
 
     domain = create_channel_mesh(geom, Re_tau=Re_tau)
+
+    reference_profile_csv = _resolve_reference_profile_csv(cfg, cfg_path)
+    if MPI.COMM_WORLD.rank == 0 and reference_profile_csv is not None:
+        print(f"Reference overlay CSV: {reference_profile_csv}")
 
     # Plot mesh
     plot_mesh(domain, geom, save_path=results_dir / "mesh.png")
@@ -103,7 +130,18 @@ Environment:
     )
 
     # Plot final results
-    plot_final_fields(u, p, k, omega, nu_t, domain, geom, Re_tau, save_path=results_dir / "final_fields.png")
+    plot_final_fields(
+        u,
+        p,
+        k,
+        omega,
+        nu_t,
+        domain,
+        geom,
+        Re_tau,
+        save_path=results_dir / "final_fields.png",
+        reference_profile_csv=reference_profile_csv,
+    )
     write_channel_profile_csv(
         u, k, omega, nu_t, domain, geom, Re_tau,
         save_path=results_dir / "profiles.csv",

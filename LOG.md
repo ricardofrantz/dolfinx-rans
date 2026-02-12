@@ -554,3 +554,200 @@ Artifacts:
 - `nek_re100k_fullchannel/final_fields.png`
 - `nek_re100k_fullchannel/convergence.png`
 - `nek_re100k_fullchannel/snps/*`
+
+## 2026-02-12 - re100k Quad + Tanh Wall Refinement
+
+User request:
+- Keep a single canonical case (`re100k`), use quadrilateral mesh, and apply tanh near-wall refinement.
+
+Code changes:
+1. `src/dolfinx_rans/solver.py`
+   - Added `geom.stretching` (`"geometric"` or `"tanh"`, default `"geometric"`).
+   - Added tanh wall-stretch generator that solves for first-cell spacing from `y_first`.
+   - Kept geometric generator as existing option.
+   - Updated periodic MPC setup for stretched quad case to use topological constraints.
+   - Added robust periodic relation mapping with small inward offset (`map_eps`) and practical tolerance.
+2. `src/dolfinx_rans/cli.py`
+   - Mesh header now prints stretching mode when wall refinement is active.
+3. `run_re100k.sh`
+   - Default generated `re100k/run_config.json` now uses:
+     - `"mesh_type": "quad"`
+     - `"stretching": "tanh"`
+     - `"growth_rate": 1.0`
+
+Validation run:
+```bash
+./run_re100k.sh
+```
+
+Observed startup diagnostics:
+- `Mesh: 192×166 (quad, tanh)`
+- `Wall-refined mesh: mode = tanh, y_first(requested) = 0.001605, y_first(actual) = 0.001605, y+_actual = 1.79`
+- No `Newton method failed to converge for non-affine geometry` error.
+
+Run completion:
+- Reached `max_iter=50` and exited cleanly.
+- Final table line:
+  - `iter=50`, `res=1.2e-02`, `U_bulk=15.045`, `tau_wall=0.0807`
+
+Artifacts written:
+- `re100k/run_config.json`
+- `re100k/results/mesh.png`
+- `re100k/results/history.csv`
+- `re100k/results/convergence.png`
+- `re100k/results/final_fields.png`
+- `re100k/results/profiles.csv`
+- `re100k/results/fields.png`
+- `re100k/results/fields_00050.png`
+- `re100k/snps/velocity.bp/*`
+- `re100k/snps/turbulence.bp/*`
+
+## 2026-02-12 - Nek Extract Script in `nek_re100k/`
+
+User request:
+- Move/adapt extraction script into `nek_re100k/` and extract + plot from
+  `nek_re100k/BF_poiseuille_RANS0.f00001`, adapting from Nek example workflow.
+
+Implementation:
+1. Added script:
+   - `nek_re100k/nek_to_csv.py`
+2. Source adaptation:
+   - Uses helper path relative to script:
+     `../../nekStab/example/poiseuille_RANS/` (for `nekplot.py`/`.par`)
+   - Reads local field:
+     `nek_re100k/BF_poiseuille_RANS0.f00001`
+
+Execution:
+```bash
+python nek_re100k/nek_to_csv.py
+```
+
+Generated artifacts (all in `nek_re100k/`):
+- `nek_to_csv.npz`
+- `nek_to_csv.csv`
+- `nek_to_csv.png`
+- `nek_to_csv.json`
+
+Key extracted metadata:
+- `Re` from `.par`: `100000.0`
+- estimated `Re_tau`: `1115.818661288065`
+- `U_bulk`: `0.9984901828353354`
+
+### Update: Export all requested quantities + print `U_bulk`
+
+Script updated:
+- `nek_re100k/nek_to_csv.py`
+
+Now exported columns in `nek_re100k/nek_to_csv.csv`:
+- `y_over_delta`
+- `u`
+- `v`
+- `pressure`
+- `scalar_1`
+- `scalar_2`
+- `u_over_ubulk`
+- `y_plus`
+- `u_plus`
+
+Runtime print now includes:
+- `U_bulk = ...`
+- field keys found in Nek file
+
+For `nek_re100k/BF_poiseuille_RANS0.f00001`, detected keys:
+- `['p', 'vx', 'vy', 'vz']`
+
+Therefore:
+- `u`, `v`, `pressure` are populated from Nek fields.
+- `scalar_1` and `scalar_2` are exported as `NaN` (not present in this field file), and this is recorded in:
+  - `nek_re100k/nek_to_csv.json` -> `scalar_availability`.
+
+### Update: direct scalar extraction + full-channel symmetry plot
+
+After user check, script was updated to read Nek data directly via `pymech` (not filtered helper keys)
+so `s01` and `s02` are captured explicitly from `elem.scal`.
+
+Current run:
+```bash
+python nek_re100k/nek_to_csv.py
+```
+
+Runtime output now shows:
+- `U_bulk = 9.9848895532955539e-01`
+- `Field keys = ['p', 's01', 's02', 't', 'vx', 'vy']`
+
+New/updated outputs in `nek_re100k/`:
+- `nek_to_csv.csv` now includes: `u, v, pressure, temp, scalar_1, scalar_2`
+- `nek_to_csv.png` multi-panel profile figure
+- `nek_to_csv_symmetry.csv` with lower branch (`0->1`) and inverted upper branch (`2->1`)
+- `nek_to_csv_symmetry.png` for symmetry check in full channel
+
+Symmetry plotting requested by user was implemented as:
+- lower profile: bottom wall to centerline (`y=0..1`)
+- upper profile: top wall to centerline, inverted (`y=2..1`)
+
+### Update: Dashed Nek overlays in `re100k/results`
+
+User request:
+- Overlay Nek reference values as dashed lines in the standard `re100k/results` plots
+  to compare FEniCS vs Nek directly.
+
+Implementation:
+1. `src/dolfinx_rans/plotting.py`
+   - `plot_final_fields(...)` now accepts optional `reference_profile_csv`.
+   - Added CSV loader for reference profiles with `y_plus,u_plus` and optional
+     `scalar_1,scalar_2,k_plus,omega_plus,nu_t_over_nu`.
+   - Overlays dashed reference lines on:
+     - `u+` semilog profile
+     - `k+` profile (uses `k_plus` or fallback `scalar_1`)
+     - `ω+` profile (uses `omega_plus` or fallback `scalar_2`)
+     - near-wall linear `u+`
+   - Dashed reference style uses orange dashed lines for visual separation.
+2. `src/dolfinx_rans/cli.py`
+   - Added reference-path resolver:
+     - uses `benchmark.reference_profile_csv` when set
+     - otherwise auto-detects `nek_re100k/nek_to_csv.csv` for re100k workflow
+   - Prints resolved overlay path at runtime.
+
+Validation run:
+```bash
+python nek_re100k/nek_to_csv.py
+./run_re100k.sh
+```
+
+Observed runtime line:
+- `Reference overlay CSV: /home/rfrantz/dolfinx-rans/nek_re100k/nek_to_csv.csv`
+
+Result:
+- Updated `re100k/results/final_fields.png` now contains dashed Nek overlays
+  for direct comparison against the FEniCS profiles.
+
+### Update: Pure Nek-style plotting axis + snapshots inside results
+
+User request:
+- Stop plotting FEniCS profiles in `y+`; use the same pure coordinate style as Nek plots.
+- Keep snapshots under `results/` (not separate `re100k/snps` folder).
+
+Implemented:
+1. `src/dolfinx_rans/plotting.py`
+   - Final profile panels switched to `y/delta` (pure coordinate).
+   - Velocity panel now plots `U/U_bulk` vs `y/delta`.
+   - `k` and `omega` plotted vs `y/delta`.
+   - Near-wall panel uses `U/U_bulk` vs `y/delta` (no wall-unit axis).
+   - Removed `u+`, `k+`, `ω+` labels from final figure annotations/titles.
+2. `src/dolfinx_rans/solver.py`
+   - Snapshot banner now prints explicit target:
+     `Saving snapshots every ... to re100k/results/snps`
+3. `run_re100k.sh`
+   - Added post-run canonicalization to move any legacy `re100k/snps` into
+     `re100k/results/snps`.
+
+Validation runs completed:
+- `./run_re100k.sh` (multiple reruns after plotting/path updates)
+- final artifacts refreshed at `2026-02-12 15:29`:
+  - `re100k/results/final_fields.png`
+  - `re100k/results/snps/velocity.bp/*`
+  - `re100k/results/snps/turbulence.bp/*`
+
+Current folder layout:
+- `re100k/results/snps/...`
+- no top-level `re100k/snps` directory remains.

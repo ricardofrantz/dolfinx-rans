@@ -31,9 +31,10 @@ write_default_re100k_config() {
     "Ly": 2.0,
     "Nx": 192,
     "Ny": 166,
-    "mesh_type": "triangle",
+    "mesh_type": "quad",
     "y_first": 0.001604628,
-    "growth_rate": 1.04,
+    "growth_rate": 1.0,
+    "stretching": "tanh",
     "y_first_tol_rel": 0.2,
     "use_symmetry": false
   },
@@ -236,6 +237,35 @@ if [ "$NPROCS" -gt 1 ]; then
     mpirun -np "$NPROCS" python -m dolfinx_rans "$CONFIG"
 else
     python -m dolfinx_rans "$CONFIG"
+fi
+
+# Keep snapshots inside results directory (clean canonical layout).
+OUT_DIR_ABS="$(python - <<PY
+import json
+from pathlib import Path
+
+cfg_path = Path("$CONFIG")
+cfg = json.loads(cfg_path.read_text())
+out_dir = Path(cfg["solve"]["out_dir"])
+if not out_dir.is_absolute():
+    out_dir = (Path("$SCRIPT_DIR") / out_dir).resolve()
+print(out_dir)
+PY
+)"
+
+CANONICAL_SNPS_DIR="$OUT_DIR_ABS/snps"
+LEGACY_SNPS_DIR="$(dirname "$OUT_DIR_ABS")/snps"
+if [ -d "$LEGACY_SNPS_DIR" ] && [ "$LEGACY_SNPS_DIR" != "$CANONICAL_SNPS_DIR" ]; then
+    mkdir -p "$CANONICAL_SNPS_DIR"
+    shopt -s nullglob
+    for item in "$LEGACY_SNPS_DIR"/*; do
+        base="$(basename "$item")"
+        rm -rf "$CANONICAL_SNPS_DIR/$base"
+        mv "$item" "$CANONICAL_SNPS_DIR/$base"
+    done
+    shopt -u nullglob
+    rmdir "$LEGACY_SNPS_DIR" 2>/dev/null || true
+    echo "Moved legacy snapshots into: $CANONICAL_SNPS_DIR"
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────

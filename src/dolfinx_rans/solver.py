@@ -4,7 +4,7 @@ RANS k-ω solver for turbulent channel flow - DOLFINx 0.10.0+
 Standard k-ω model with:
 - Pseudo-transient continuation to steady state
 - Adaptive time stepping with hysteresis
-- Wall-refined mesh with geometric stretching
+- Wall-refined mesh with geometric or tanh stretching
 - Optional Durbin realizability limiter
 - High-Re benchmark workflow (Nek5000-style periodic channel)
 - Optional external cross-code profile comparison
@@ -158,6 +158,7 @@ class ChannelGeom:
     mesh_type: str  # "triangle" or "quad"
     y_first: float  # First cell height from wall (for y+ control)
     growth_rate: float  # Geometric stretching ratio (>1 for wall refinement)
+    stretching: str = "geometric"  # "geometric" or "tanh"
     y_first_tol_rel: float = 0.05  # Hard-fail if implied y_first differs by more than this
     use_symmetry: bool = True  # Half-channel with symmetry BC at top (default: True)
 
@@ -253,21 +254,39 @@ def create_channel_mesh(geom: ChannelGeom, Re_tau: float = None):
     comm = MPI.COMM_WORLD
     if geom.y_first_tol_rel < 0:
         raise ValueError(f"geom.y_first_tol_rel must be >= 0, got {geom.y_first_tol_rel}")
+    stretching = geom.stretching.lower()
+    if stretching not in {"geometric", "tanh"}:
+        raise ValueError(
+            f"Unknown geom.stretching='{geom.stretching}'. Expected 'geometric' or 'tanh'."
+        )
 
-    if geom.growth_rate > 1.0 and geom.y_first > 0:
-        # Wall-refined mesh with geometric stretching
+    use_stretched = geom.y_first > 0 and (stretching == "tanh" or geom.growth_rate > 1.0)
+    if use_stretched:
+        # Wall-refined mesh
         Ny = geom.Ny
         Ly = geom.Ly
 
         if geom.use_symmetry:
             # Half-channel: only [0, Ly] with wall at bottom, symmetry at top
-            y_coords = _generate_stretched_coords(geom.y_first, Ly, Ny, geom.growth_rate)
+            y_coords = _generate_stretched_coords(
+                y_first=geom.y_first,
+                H=Ly,
+                N=Ny,
+                growth=geom.growth_rate,
+                stretching=stretching,
+            )
             if comm.rank == 0:
                 print(f"Half-channel (symmetry at y={Ly:.2f})")
         else:
             # Full channel: [0, Ly] with walls at both ends
             H = Ly / 2.0  # Half-height
-            y_lower = _generate_stretched_coords(geom.y_first, H, Ny // 2, geom.growth_rate)
+            y_lower = _generate_stretched_coords(
+                y_first=geom.y_first,
+                H=H,
+                N=Ny // 2,
+                growth=geom.growth_rate,
+                stretching=stretching,
+            )
             y_upper = Ly - y_lower[::-1]
             y_coords = np.concatenate([y_lower, y_upper[1:]])
             if comm.rank == 0:
@@ -290,6 +309,7 @@ def create_channel_mesh(geom: ChannelGeom, Re_tau: float = None):
             y_plus_first = y_first_actual * Re_tau
             print(
                 "Wall-refined mesh: "
+                f"mode = {stretching}, "
                 f"y_first(requested) = {geom.y_first:.6f}, "
                 f"y_first(actual) = {y_first_actual:.6f}, "
                 f"y+_actual = {y_plus_first:.2f}"
@@ -326,12 +346,27 @@ def create_channel_mesh(geom: ChannelGeom, Re_tau: float = None):
     return domain
 
 
-def _generate_stretched_coords(y_first: float, H: float, N: int, growth: float) -> np.ndarray:
+def _generate_stretched_coords(
+    y_first: float,
+    H: float,
+    N: int,
+    growth: float,
+    stretching: str,
+) -> np.ndarray:
+    """Generate stretched y-coordinates with the requested stretching mode."""
+    if stretching == "geometric":
+        return _generate_stretched_coords_geometric(H, N, growth)
+    if stretching == "tanh":
+        return _generate_stretched_coords_tanh(y_first, H, N)
+    raise ValueError(f"Unsupported stretching mode: {stretching}")
+
+
+def _generate_stretched_coords_geometric(H: float, N: int, growth: float) -> np.ndarray:
     """
     Generate geometrically stretched y-coordinates from wall to midplane.
 
-    Note: With fixed (H, N, growth), the first spacing is determined by the
-    geometric-series closure and can differ from the requested y_first value.
+    With fixed (H, N, growth), the first spacing is determined by the
+    geometric-series closure.
     """
     if growth == 1.0:
         return np.linspace(0, H, N + 1)
@@ -350,6 +385,50 @@ def _generate_stretched_coords(y_first: float, H: float, N: int, growth: float) 
         dy *= growth
 
     y[-1] = H  # Ensure exact endpoint
+    return y
+
+
+def _generate_stretched_coords_tanh(y_first: float, H: float, N: int) -> np.ndarray:
+    """
+    Generate wall-refined coordinates using:
+        y(eta) = H * [1 - tanh(beta*(1-eta))/tanh(beta)], eta in [0,1]
+    and solve beta so that the first spacing matches y_first.
+    """
+    if N <= 0:
+        raise ValueError(f"N must be > 0 for tanh stretching, got {N}")
+    if y_first <= 0 or y_first >= H:
+        raise ValueError(f"tanh stretching requires 0 < y_first < H, got y_first={y_first}, H={H}")
+
+    dy_uniform = H / N
+    if y_first >= dy_uniform:
+        return np.linspace(0, H, N + 1)
+
+    eta = np.linspace(0.0, 1.0, N + 1)
+
+    def dy1(beta: float) -> float:
+        return H * (1.0 - np.tanh(beta * (1.0 - 1.0 / N)) / np.tanh(beta))
+
+    beta_lo = 1e-12
+    beta_hi = 1.0
+    while dy1(beta_hi) > y_first:
+        beta_hi *= 2.0
+        if beta_hi > 1e6:
+            raise ValueError(
+                "Could not match requested y_first with tanh stretching. "
+                f"Requested y_first={y_first:.6e}, H={H:.6e}, N={N}."
+            )
+
+    for _ in range(80):
+        beta_mid = 0.5 * (beta_lo + beta_hi)
+        if dy1(beta_mid) > y_first:
+            beta_lo = beta_mid
+        else:
+            beta_hi = beta_mid
+
+    beta = 0.5 * (beta_lo + beta_hi)
+    y = H * (1.0 - np.tanh(beta * (1.0 - eta)) / np.tanh(beta))
+    y[0] = 0.0
+    y[-1] = H
     return y
 
 
@@ -752,7 +831,8 @@ def solve_rans_kw(
             raise RuntimeError(
                 "Periodic BCs require dolfinx_mpc. Install: conda install -c conda-forge dolfinx_mpc"
             )
-        tol = 250 * np.finfo(domain.geometry.x.dtype).resolution
+        tol = max(1e-10, 250 * np.finfo(domain.geometry.x.dtype).eps)
+        map_eps = max(1e-12, tol)
 
         def periodic_boundary(x):
             return np.isclose(x[0], geom.Lx, atol=tol)
@@ -760,18 +840,52 @@ def solve_rans_kw(
         def periodic_relation(x):
             y = x.copy()
             y[0] -= geom.Lx
+            # Keep mapped points slightly inside the master side to avoid
+            # point-location failures on quadrilateral boundary geometry.
+            y[0] = np.where(np.isclose(y[0], 0.0, atol=tol), map_eps, y[0])
             return y
 
+        use_topological_periodic = (
+            geom.mesh_type == "quad"
+            and (geom.stretching.lower() == "tanh" or geom.growth_rate > 1.0)
+        )
+        if use_topological_periodic:
+            right_facets_sorted = np.unique(np.sort(right_facets)).astype(np.int32, copy=False)
+            if right_facets_sorted.size == 0:
+                raise RuntimeError("Could not locate right boundary facets for periodic constraint setup.")
+            slave_tag = np.int32(1)
+            right_tags = np.full(right_facets_sorted.shape, slave_tag, dtype=np.int32)
+            right_mt = mesh.meshtags(domain, fdim, right_facets_sorted, right_tags)
+
         mpc_V = MultiPointConstraint(V0)
-        mpc_V.create_periodic_constraint_geometrical(V0, periodic_boundary, periodic_relation, bcs_u0)
+        if use_topological_periodic:
+            mpc_V.create_periodic_constraint_topological(
+                V0, right_mt, int(slave_tag), periodic_relation, bcs_u0, tol=tol
+            )
+        else:
+            mpc_V.create_periodic_constraint_geometrical(
+                V0, periodic_boundary, periodic_relation, bcs_u0
+            )
         mpc_V.finalize()
 
         mpc_Q = MultiPointConstraint(Q0)
-        mpc_Q.create_periodic_constraint_geometrical(Q0, periodic_boundary, periodic_relation, [])
+        if use_topological_periodic:
+            mpc_Q.create_periodic_constraint_topological(
+                Q0, right_mt, int(slave_tag), periodic_relation, [], tol=tol
+            )
+        else:
+            mpc_Q.create_periodic_constraint_geometrical(Q0, periodic_boundary, periodic_relation, [])
         mpc_Q.finalize()
 
         mpc_S = MultiPointConstraint(S0)
-        mpc_S.create_periodic_constraint_geometrical(S0, periodic_boundary, periodic_relation, [bc_k_wall0])
+        if use_topological_periodic:
+            mpc_S.create_periodic_constraint_topological(
+                S0, right_mt, int(slave_tag), periodic_relation, [bc_k_wall0], tol=tol
+            )
+        else:
+            mpc_S.create_periodic_constraint_geometrical(
+                S0, periodic_boundary, periodic_relation, [bc_k_wall0]
+            )
         mpc_S.finalize()
 
         V = mpc_V.function_space
@@ -1180,7 +1294,10 @@ def solve_rans_kw(
         print(f"\nSolving RANS k-ω channel flow", flush=True)
         print(f"dt={dt}, t_final={solve.t_final}, picard_max={solve.picard_max}", flush=True)
         if solve.snapshot_interval > 0:
-            print(f"Saving snapshots every {solve.snapshot_interval} steps to snps/", flush=True)
+            print(
+                f"Saving snapshots every {solve.snapshot_interval} steps to {results_dir / 'snps'}",
+                flush=True,
+            )
         print(flush=True)
 
     t = 0.0

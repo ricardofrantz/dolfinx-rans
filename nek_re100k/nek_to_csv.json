@@ -1,0 +1,35 @@
+{
+  "field_file": "/home/rfrantz/dolfinx-rans/nek_re100k/BF_poiseuille_RANS0.f00001",
+  "source_par": "/home/rfrantz/nekStab/example/poiseuille_RANS/poiseuille_RANS.par",
+  "nek_time": 200.0,
+  "domain_bounds": {
+    "x_min": 0.0,
+    "x_max": 6.2831854820251465,
+    "y_min": -1.0,
+    "y_max": 1.0
+  },
+  "parsed_from_par": {
+    "nu": 1e-05,
+    "re": 100000.0
+  },
+  "estimated_wall_quantities": {
+    "du_dy_wall": 12.455170669186115,
+    "tau_wall": 0.00012455170669186115,
+    "u_tau": 0.011160273593951948,
+    "re_tau": 1116.0273593951947
+  },
+  "available_field_keys": [
+    "p",
+    "s01",
+    "s02",
+    "t",
+    "vx",
+    "vy"
+  ],
+  "scalar_availability": {
+    "temp_present": true,
+    "s01_present": true,
+    "s02_present": true
+  },
+  "u_bulk": 0.9984889553295554
+}

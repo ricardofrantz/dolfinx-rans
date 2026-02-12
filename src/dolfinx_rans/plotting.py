@@ -188,6 +188,49 @@ def write_channel_profile_csv(u, k, omega, nu_t, domain, geom, Re_tau, save_path
     print(f"  Saved profile CSV: {save_path}")
 
 
+def _load_reference_profile_csv(path: Path | None):
+    """Load reference profile CSV for dashed overlays on final profile plots."""
+    if path is None:
+        return None
+    if not path.exists():
+        return None
+
+    import csv
+
+    with path.open() as f:
+        rows = list(csv.DictReader(f))
+    if not rows:
+        return None
+
+    header = rows[0]
+    if "y_over_delta" not in header:
+        return None
+
+    y_over_delta = np.array([float(r["y_over_delta"]) for r in rows], dtype=float)
+    order = np.argsort(y_over_delta)
+    out = {
+        "label": f"Reference ({path.stem})",
+        "y_over_delta": y_over_delta[order],
+    }
+
+    for key in ("u", "u_over_ubulk", "v", "pressure", "temp", "scalar_1", "scalar_2"):
+        if key in header:
+            out[key] = np.array([float(r[key]) for r in rows], dtype=float)[order]
+
+    # Backward compatibility for older reference profiles.
+    if "u_over_ubulk" not in out and "u_plus" in header:
+        out["u"] = np.array([float(r["u_plus"]) for r in rows], dtype=float)[order]
+
+    # If only raw u is provided, build U/U_bulk from the same profile.
+    if "u_over_ubulk" not in out and "u" in out:
+        y_ref = np.asarray(out["y_over_delta"], dtype=float)
+        u_ref = np.asarray(out["u"], dtype=float)
+        bulk = float(np.trapezoid(u_ref, y_ref) / max(y_ref[-1] - y_ref[0], 1e-30))
+        out["u_over_ubulk"] = u_ref / max(bulk, 1e-30)
+
+    return out
+
+
 def plot_initial_conditions(u, p, k, omega, nu_t, domain, geom, Re_tau, save_path: Path | None = None):
     """Plot initial condition fields.
 
@@ -277,7 +320,18 @@ def plot_initial_conditions(u, p, k, omega, nu_t, domain, geom, Re_tau, save_pat
     plt.close(fig)
 
 
-def plot_final_fields(u, p, k, omega, nu_t, domain, geom, Re_tau, save_path: Path | None = None):
+def plot_final_fields(
+    u,
+    p,
+    k,
+    omega,
+    nu_t,
+    domain,
+    geom,
+    Re_tau,
+    save_path: Path | None = None,
+    reference_profile_csv: Path | None = None,
+):
     """Plot final solution fields as contours and profiles.
 
     MPI-safe: all ranks participate in extraction, only rank 0 plots.
@@ -301,6 +355,8 @@ def plot_final_fields(u, p, k, omega, nu_t, domain, geom, Re_tau, save_path: Pat
     if comm.rank != 0:
         return
 
+    reference = _load_reference_profile_csv(reference_profile_csv)
+
     nu = 1.0 / Re_tau
     ar = geom.Lx / geom.Ly  # channel aspect ratio (~6.28)
     # Contour row height adapts to true geometry; profile rows are fixed
@@ -309,67 +365,131 @@ def plot_final_fields(u, p, k, omega, nu_t, domain, geom, Re_tau, save_path: Pat
                              gridspec_kw={"height_ratios": [contour_h, 4, 4]})
 
     # --- Row 0: 2D contour plots ---
-    _tricontour(axes[0, 0], ux_x, ux_y, ux_vals, "u⁺", geom)
-    _tricontour(axes[0, 1], k_x, k_y, k_vals, "k⁺", geom)
+    _tricontour(axes[0, 0], ux_x, ux_y, ux_vals, "u", geom)
+    _tricontour(axes[0, 1], k_x, k_y, k_vals, "k", geom)
     _tricontour(axes[0, 2], nut_x, nut_y, nut_vals / nu, "ν_t/ν", geom)
 
-    # --- Row 1: 1D profiles ---
-    delta = geom.Ly / 2
+    # --- Row 1: 1D profiles (pure y/delta, no y+) ---
+    delta = geom.Ly if geom.use_symmetry else geom.Ly / 2.0
     y_lower = y_vals[y_vals <= delta]
-    y_plus = y_lower * Re_tau
+    y_over_delta = y_lower / max(delta, 1e-30)
 
-    # u+ (semilog with law of the wall)
+    # U/U_bulk
     ax = axes[1, 0]
     u_lower = u_profile[: len(y_lower)]
-    ax.semilogx(y_plus, u_lower, "b-", linewidth=2, label="RANS k-ω")
-    y_visc = np.linspace(1, 11, 50)
-    y_log = np.linspace(11, 300, 50)
-    ax.semilogx(y_visc, y_visc, "k--", linewidth=1, alpha=0.5, label="u⁺=y⁺")
-    ax.semilogx(y_log, 2.5 * np.log(y_log) + 5.5, "k:", linewidth=1, alpha=0.5, label="log law")
-    ax.set_xlabel("y⁺")
-    ax.set_ylabel("u⁺")
+    u_bulk_local = float(
+        np.trapezoid(u_lower, y_over_delta) / max(y_over_delta[-1] - y_over_delta[0], 1e-30)
+    )
+    ax.plot(y_over_delta, u_lower / max(u_bulk_local, 1e-30), "b-", linewidth=2, label="FEniCS (RANS k-ω)")
+    if reference is not None:
+        ref_y = np.asarray(reference["y_over_delta"], dtype=float)
+        ref_u = np.asarray(reference.get("u_over_ubulk"), dtype=float)
+        valid = np.isfinite(ref_y) & np.isfinite(ref_u)
+        if np.any(valid):
+            ax.plot(
+                ref_y[valid],
+                ref_u[valid],
+                linestyle="--",
+                color="tab:orange",
+                linewidth=1.8,
+                label=f"Nek ({reference['label']})",
+            )
+    ax.set_xlabel("y/delta")
+    ax.set_ylabel("U/U_bulk")
     ax.set_title("Mean velocity profile")
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
-    ax.set_xlim(1, 600)
+    ax.set_xlim(0.0, 1.0)
 
-    # k+
+    # k
     ax = axes[1, 1]
     k_lower = k_profile[: len(y_lower)]
-    ax.plot(y_plus, k_lower, "r-", linewidth=2)
-    ax.set_xlabel("y⁺")
-    ax.set_ylabel("k⁺")
+    ax.plot(y_over_delta, k_lower, "r-", linewidth=2, label="FEniCS k")
+    if reference is not None:
+        ref_y = np.asarray(reference["y_over_delta"], dtype=float)
+        ref_k = None
+        ref_label = None
+        if "scalar_1" in reference:
+            ref_k = np.asarray(reference["scalar_1"], dtype=float)
+            ref_label = "Nek scalar_1"
+        if ref_k is not None:
+            valid = np.isfinite(ref_y) & np.isfinite(ref_k)
+            if np.any(valid):
+                ax.plot(
+                    ref_y[valid],
+                    ref_k[valid],
+                    linestyle="--",
+                    color="tab:orange",
+                    linewidth=1.8,
+                    label=ref_label,
+                )
+                ax.legend(fontsize=8)
+    ax.set_xlabel("y/delta")
+    ax.set_ylabel("k")
     ax.set_title("Turbulent kinetic energy")
     ax.grid(True, alpha=0.3)
+    ax.set_xlim(0.0, 1.0)
 
     # omega (log scale)
     ax = axes[1, 2]
     omega_lower = omega_profile[: len(y_lower)]
-    ax.semilogy(y_plus, omega_lower, "g-", linewidth=2)
-    ax.set_xlabel("y⁺")
-    ax.set_ylabel("ω⁺")
+    ax.semilogy(y_over_delta, omega_lower, "g-", linewidth=2, label="FEniCS omega")
+    if reference is not None:
+        ref_y = np.asarray(reference["y_over_delta"], dtype=float)
+        ref_w = None
+        ref_label = None
+        if "scalar_2" in reference:
+            ref_w = np.asarray(reference["scalar_2"], dtype=float)
+            ref_label = "Nek scalar_2"
+        if ref_w is not None:
+            valid = np.isfinite(ref_y) & np.isfinite(ref_w) & (ref_w > 0)
+            if np.any(valid):
+                ax.semilogy(
+                    ref_y[valid],
+                    ref_w[valid],
+                    linestyle="--",
+                    color="tab:orange",
+                    linewidth=1.8,
+                    label=ref_label,
+                )
+                ax.legend(fontsize=8)
+    ax.set_xlabel("y/delta")
+    ax.set_ylabel("omega")
     ax.set_title("Specific dissipation")
     ax.grid(True, alpha=0.3)
+    ax.set_xlim(0.0, 1.0)
 
     # --- Row 2: more profiles ---
     # nu_t/nu
     ax = axes[2, 0]
     nu_t_lower = nu_t_profile[: len(y_lower)]
-    ax.plot(y_plus, nu_t_lower / nu, "m-", linewidth=2)
-    ax.set_xlabel("y⁺")
+    ax.plot(y_over_delta, nu_t_lower / nu, "m-", linewidth=2)
+    ax.set_xlabel("y/delta")
     ax.set_ylabel("ν_t/ν")
     ax.set_title("Eddy viscosity ratio")
     ax.grid(True, alpha=0.3)
+    ax.set_xlim(0.0, 1.0)
 
-    # Linear u+ for near-wall check
+    # Near-wall U/U_bulk (linear)
     ax = axes[2, 1]
-    ax.plot(y_plus, u_lower, "b-", linewidth=2, label="RANS k-ω")
-    ax.plot(y_plus, y_plus, "k--", linewidth=1, alpha=0.5, label="u⁺=y⁺")
-    ax.set_xlabel("y⁺")
-    ax.set_ylabel("u⁺")
-    ax.set_title("Near-wall velocity (linear)")
-    ax.set_xlim(0, 30)
-    ax.set_ylim(0, 20)
+    ax.plot(y_over_delta, u_lower / max(u_bulk_local, 1e-30), "b-", linewidth=2, label="FEniCS")
+    if reference is not None:
+        ref_y = np.asarray(reference["y_over_delta"], dtype=float)
+        ref_u = np.asarray(reference.get("u_over_ubulk"), dtype=float)
+        valid = np.isfinite(ref_y) & np.isfinite(ref_u)
+        if np.any(valid):
+            ax.plot(
+                ref_y[valid],
+                ref_u[valid],
+                linestyle="--",
+                color="tab:orange",
+                linewidth=1.8,
+                label="Nek",
+            )
+    ax.set_xlabel("y/delta")
+    ax.set_ylabel("U/U_bulk")
+    ax.set_title("Near-wall velocity")
+    ax.set_xlim(0.0, 0.08)
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
 
@@ -379,9 +499,9 @@ def plot_final_fields(u, p, k, omega, nu_t, domain, geom, Re_tau, save_path: Pat
     info_text = (
         f"Final Solution\n"
         f"─────────────────\n"
-        f"u⁺_max = {np.max(u_profile):.3f}\n"
-        f"k⁺: [{np.min(k_profile):.2e}, {np.max(k_profile):.2e}]\n"
-        f"ω⁺: [{np.min(omega_profile):.2e}, {np.max(omega_profile):.2e}]\n"
+        f"u_max = {np.max(u_profile):.3f}\n"
+        f"k: [{np.min(k_profile):.2e}, {np.max(k_profile):.2e}]\n"
+        f"omega: [{np.min(omega_profile):.2e}, {np.max(omega_profile):.2e}]\n"
         f"ν_t/ν max = {np.max(nu_t_profile) / nu:.1f}\n"
     )
     ax.text(0.1, 0.9, info_text, transform=ax.transAxes, fontsize=11,
