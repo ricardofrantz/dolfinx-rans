@@ -73,7 +73,7 @@ Examples:
     dolfinx-rans --print-only channel_nek_re125k_like.json
 
 Environment:
-    Requires DOLFINx 0.10.0+ and dolfinx_mpc for periodic BCs.
+    Requires DOLFINx 0.10.0+.
     Activate your FEniCSx environment before running.
         """,
     )

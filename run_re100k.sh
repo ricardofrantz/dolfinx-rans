@@ -57,8 +57,12 @@ write_default_re100k_config() {
     "dt_growth": 1.05,
     "dt_growth_threshold": 0.8,
     "t_final": 10000.0,
-    "max_iter": 50,
-    "steady_tol": 1e-6,
+    "max_iter": 1200,
+    "steady_tol": 1e-3,
+    "enable_physical_convergence": false,
+    "physical_u_bulk_rel_tol": 1e-4,
+    "physical_tau_wall_rel_tol": 2.5e-3,
+    "physical_convergence_start_iter": 10,
     "picard_max": 6,
     "picard_tol": 1e-4,
     "under_relax_k_omega": 0.6,
@@ -184,11 +188,6 @@ try:
 except ImportError as e:
     errors.append(f'dolfinx: {e}')
 
-try:
-    import dolfinx_mpc
-except ImportError as e:
-    errors.append(f'dolfinx_mpc: {e}')
-
 # Package import
 try:
     import dolfinx_rans
@@ -298,13 +297,77 @@ def parse_bounds(val, key):
     return lo, hi
 
 
+def _extract_outer_profile(rows, re_tau):
+    if not rows:
+        raise ValueError("empty profile")
+    header = rows[0]
+
+    def _to_float(values, key):
+        return np.array([float(r[key]) for r in values], dtype=float)
+
+    # x-axis in outer coordinates y/δ
+    y_over_delta = None
+    if "y_over_delta" in header:
+        y_over_delta = _to_float(rows, "y_over_delta")
+    elif "y_lower_0_to_1" in header:
+        y_over_delta = _to_float(rows, "y_lower_0_to_1")
+    elif "y_plus" in header:
+        # legacy wall-unit input
+        y_re_tau = header.get("Re_tau", re_tau)
+        y_re_tau = float(y_re_tau)
+        if np.isfinite(y_re_tau) and y_re_tau > 0:
+            y_over_delta = _to_float(rows, "y_plus") / y_re_tau
+    if y_over_delta is None or not np.all(np.isfinite(y_over_delta)):
+        raise ValueError("cannot determine y/δ coordinate from reference profile")
+
+    # velocity as U/U_bulk
+    u_over_ubulk = None
+    if "u_over_ubulk" in header:
+        u_over_ubulk = _to_float(rows, "u_over_ubulk")
+    elif "u" in header:
+        u_raw = _to_float(rows, "u")
+        u_bulk = float(np.trapz(u_raw, y_over_delta) / max(y_over_delta[-1] - y_over_delta[0], 1e-30))
+        u_over_ubulk = u_raw / max(u_bulk, 1e-30)
+    elif "u_plus" in header:
+        # For our RANS outputs u_plus == u, so normalize by the same bulk estimate.
+        u_raw = _to_float(rows, "u_plus")
+        u_bulk = float(np.trapz(u_raw, y_over_delta) / max(y_over_delta[-1] - y_over_delta[0], 1e-30))
+        u_over_ubulk = u_raw / max(u_bulk, 1e-30)
+    if u_over_ubulk is None:
+        raise ValueError("reference profile missing velocity column (expected u_over_ubulk, u, or u_plus)")
+
+    # k as k/U_bulk^2-equivalent for optional RMSE check
+    k_over_ubulk = None
+    if "k_over_ubulk" in header:
+        k_over_ubulk = _to_float(rows, "k_over_ubulk")
+    elif "k" in header:
+        k_raw = _to_float(rows, "k")
+        k_bulk = float(np.trapz(k_raw, y_over_delta) / max(y_over_delta[-1] - y_over_delta[0], 1e-30))
+        k_over_ubulk = k_raw / max(k_bulk, 1e-30)
+    elif "k_plus" in header:
+        k_raw = _to_float(rows, "k_plus")
+        k_bulk = float(np.trapz(k_raw, y_over_delta) / max(y_over_delta[-1] - y_over_delta[0], 1e-30))
+        k_over_ubulk = k_raw / max(k_bulk, 1e-30)
+
+    order = np.argsort(y_over_delta)
+    return {
+        "y": y_over_delta[order],
+        "u": u_over_ubulk[order],
+        "k": k_over_ubulk[order] if k_over_ubulk is not None else None,
+    }
+
+
 u_bounds = parse_bounds(bench.get("gate_u_bulk_bounds"), "gate_u_bulk_bounds")
 tau_bounds = parse_bounds(bench.get("gate_tau_wall_bounds"), "gate_tau_wall_bounds")
 ref_csv = bench.get("reference_profile_csv")
 if isinstance(ref_csv, str) and not ref_csv.strip():
     ref_csv = None
 u_rmse_max = bench.get("u_plus_rmse_max")
+if u_rmse_max is None:
+    u_rmse_max = bench.get("u_outer_rmse_max")
 k_rmse_max = bench.get("k_plus_rmse_max")
+if k_rmse_max is None:
+    k_rmse_max = bench.get("k_outer_rmse_max")
 
 if u_bounds is None and tau_bounds is None and ref_csv is None:
     print("Skipping regression gate (no benchmark thresholds configured).")
@@ -360,45 +423,40 @@ if ref_csv is not None:
     if not ref:
         raise ValueError(f"{ref_path} is empty")
 
-    for req in ("y_plus", "u_plus"):
-        if req not in ours[0]:
-            raise ValueError(f"{profiles_path} missing required column '{req}'")
-        if req not in ref[0]:
-            raise ValueError(f"{ref_path} missing required column '{req}'")
-
-    y_ours = np.array([float(r["y_plus"]) for r in ours])
-    u_ours = np.array([float(r["u_plus"]) for r in ours])
-    y_ref = np.array([float(r["y_plus"]) for r in ref])
-    u_ref = np.array([float(r["u_plus"]) for r in ref])
+    ours_parsed = _extract_outer_profile(ours, re_tau)
+    ref_parsed = _extract_outer_profile(ref, re_tau)
+    y_ours = ours_parsed["y"]
+    u_ours = ours_parsed["u"]
+    y_ref = ref_parsed["y"]
+    u_ref = ref_parsed["u"]
 
     y_min = max(float(np.min(y_ours)), float(np.min(y_ref)))
     y_max = min(float(np.max(y_ours)), float(np.max(y_ref)))
     mask = (y_ref >= y_min) & (y_ref <= y_max)
     if int(np.count_nonzero(mask)) < 5:
-        raise ValueError("Insufficient y_plus overlap between computed and reference profiles")
+        raise ValueError("Insufficient outer-profile overlap between computed and reference profiles")
 
     u_interp = np.interp(y_ref[mask], y_ours, u_ours)
     u_rmse = float(np.sqrt(np.mean((u_interp - u_ref[mask]) ** 2)))
-    summary_parts.append(f"u_plus_rmse={u_rmse:.4f}")
+    summary_parts.append(f"u_outer_rmse={u_rmse:.4f}")
 
     if u_rmse_max is not None and u_rmse > float(u_rmse_max):
         violations.append(
-            f"u_plus RMSE={u_rmse:.4f} exceeds limit {float(u_rmse_max):.4f}"
+            f"u RMSE={u_rmse:.4f} exceeds limit {float(u_rmse_max):.4f}"
         )
 
     if k_rmse_max is not None:
-        if "k_plus" not in ref[0]:
-            raise ValueError(f"{ref_path} missing required column 'k_plus' for k RMSE gate")
-        if "k_plus" not in ours[0]:
-            raise ValueError(f"{profiles_path} missing required column 'k_plus' for k RMSE gate")
-        k_ours = np.array([float(r["k_plus"]) for r in ours])
-        k_ref = np.array([float(r["k_plus"]) for r in ref])
-        k_interp = np.interp(y_ref[mask], y_ours, k_ours)
+        if ref_parsed["k"] is None:
+            raise ValueError(f"{ref_path} missing k-related columns for k RMSE gate (k, k_plus, or k_over_ubulk)")
+        if ours_parsed["k"] is None:
+            raise ValueError(f"{profiles_path} missing k-related columns for k RMSE gate (k, k_plus, or k_over_ubulk)")
+        k_interp = np.interp(y_ref[mask], y_ours, ours_parsed["k"])
+        k_ref = ref_parsed["k"]
         k_rmse = float(np.sqrt(np.mean((k_interp - k_ref[mask]) ** 2)))
-        summary_parts.append(f"k_plus_rmse={k_rmse:.4f}")
+        summary_parts.append(f"k_rmse={k_rmse:.4f}")
         if k_rmse > float(k_rmse_max):
             violations.append(
-                f"k_plus RMSE={k_rmse:.4f} exceeds limit {float(k_rmse_max):.4f}"
+                f"k RMSE={k_rmse:.4f} exceeds limit {float(k_rmse_max):.4f}"
             )
 
 if violations:

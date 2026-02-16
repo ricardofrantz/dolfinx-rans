@@ -6,7 +6,6 @@ turbulence models for channel-flow benchmarking.
 
 Requirements:
     - DOLFINx 0.10.0+
-    - dolfinx_mpc (for periodic boundary conditions)
     - numpy, matplotlib
 
 Example:

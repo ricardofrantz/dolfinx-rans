@@ -6,7 +6,7 @@ Standard k-omega model with:
 - Adaptive time stepping with hysteresis
 - Wall-refined mesh with geometric or tanh stretching
 - Optional Durbin realizability limiter
-- High-Re benchmark workflow (Nek5000-style periodic channel)
+- High-Re benchmark workflow (body-force-driven channel)
 - Optional external cross-code profile comparison
 
 GOVERNING EQUATIONS (NONDIMENSIONAL)
@@ -41,7 +41,6 @@ import numpy as np
 from mpi4py import MPI
 from petsc4py import PETSc
 
-from dolfinx import mesh
 from dolfinx.fem import (
     Constant,
     Expression,
@@ -60,16 +59,6 @@ from dolfinx.fem.petsc import (
     set_bc,
 )
 from dolfinx.io import VTXWriter
-
-try:
-    from dolfinx_mpc import MultiPointConstraint
-    from dolfinx_mpc import apply_lifting as mpc_apply_lifting
-    from dolfinx_mpc import assemble_matrix as mpc_assemble_matrix
-    from dolfinx_mpc import assemble_vector as mpc_assemble_vector
-
-    HAVE_MPC = True
-except ImportError:
-    HAVE_MPC = False
 
 import ufl
 from ufl import (
@@ -111,7 +100,6 @@ from dolfinx_rans.config import (
 )
 from dolfinx_rans.geometry import (
     compute_wall_distance_channel,
-    create_channel_mesh,
     infer_first_offwall_spacing,
     initial_k_channel,
     initial_omega_channel,
@@ -360,112 +348,18 @@ def solve_rans_kw(
             )
     omega_wall_val = 6.0 * nu / (BETA_0 * y_first**2)
 
+    u_noslip = np.array([0.0, 0.0], dtype=PETSc.ScalarType)
+
     if geom.use_symmetry:
         # Half-channel: wall at bottom, symmetry at top
         # Bottom: no-slip (u=0, v=0), k=0, omega=omega_wall
         # Top: symmetry (v=0, du/dy=0 natural, dk/dy=0 natural, domega/dy=0 natural)
-        wall_facets_tb = bottom_facets  # Only bottom wall for symmetry case
-        wall_dofs_V0 = locate_dofs_topological(V0, fdim, bottom_facets)
-        wall_dofs_S0 = locate_dofs_topological(S0, fdim, bottom_facets)
-
-        u_noslip = np.array([0.0, 0.0], dtype=PETSc.ScalarType)
-        bc_walls_u0 = dirichletbc(u_noslip, wall_dofs_V0, V0)
-        bc_k_wall0 = dirichletbc(PETSc.ScalarType(0.0), wall_dofs_S0, S0)
-
-        # Symmetry BC at top: v=0 (y-component only)
-        # DOLFINx 0.10.0 requires Function on collapsed subspace for subspace BC
-        V0_y_sub = V0.sub(1)
-        V0_y_collapsed, _ = V0_y_sub.collapse()
-        zero_vy = Function(V0_y_collapsed)
-        zero_vy.x.array[:] = 0.0
-        top_dofs_Vy = locate_dofs_topological((V0_y_sub, V0_y_collapsed), fdim, top_facets)
-        bc_sym_v0 = dirichletbc(zero_vy, top_dofs_Vy, V0_y_sub)
-
-        bcs_u0 = [bc_walls_u0, bc_sym_v0]
+        wall_facets_tb = bottom_facets
     else:
         # Full channel: walls at both top and bottom
         wall_facets_tb = np.concatenate([bottom_facets, top_facets])
-        wall_dofs_V0 = locate_dofs_topological(V0, fdim, wall_facets_tb)
-        wall_dofs_S0 = locate_dofs_topological(S0, fdim, wall_facets_tb)
 
-        u_noslip = np.array([0.0, 0.0], dtype=PETSc.ScalarType)
-        bc_walls_u0 = dirichletbc(u_noslip, wall_dofs_V0, V0)
-        bc_k_wall0 = dirichletbc(PETSc.ScalarType(0.0), wall_dofs_S0, S0)
-
-        bcs_u0 = [bc_walls_u0]
-
-    use_periodic = use_body_force
-    mpc_V = None
-    mpc_Q = None
-    mpc_S = None
-
-    if use_periodic:
-        if not HAVE_MPC:
-            raise RuntimeError(
-                "Periodic BCs require dolfinx_mpc. Install: conda install -c conda-forge dolfinx_mpc"
-            )
-        tol = max(1e-10, 250 * np.finfo(domain.geometry.x.dtype).eps)
-        map_eps = max(1e-12, tol)
-
-        def periodic_boundary(x):
-            return np.isclose(x[0], geom.Lx, atol=tol)
-
-        def periodic_relation(x):
-            y = x.copy()
-            y[0] -= geom.Lx
-            # Keep mapped points slightly inside the master side to avoid
-            # point-location failures on quadrilateral boundary geometry.
-            y[0] = np.where(np.isclose(y[0], 0.0, atol=tol), map_eps, y[0])
-            return y
-
-        use_topological_periodic = (
-            geom.mesh_type == "quad"
-            and (geom.stretching.lower() == "tanh" or geom.growth_rate > 1.0)
-        )
-        if use_topological_periodic:
-            right_facets_sorted = np.unique(np.sort(right_facets)).astype(np.int32, copy=False)
-            if right_facets_sorted.size == 0:
-                raise RuntimeError("Could not locate right boundary facets for periodic constraint setup.")
-            slave_tag = np.int32(1)
-            right_tags = np.full(right_facets_sorted.shape, slave_tag, dtype=np.int32)
-            right_mt = mesh.meshtags(domain, fdim, right_facets_sorted, right_tags)
-
-        mpc_V = MultiPointConstraint(V0)
-        if use_topological_periodic:
-            mpc_V.create_periodic_constraint_topological(
-                V0, right_mt, int(slave_tag), periodic_relation, bcs_u0, tol=tol
-            )
-        else:
-            mpc_V.create_periodic_constraint_geometrical(
-                V0, periodic_boundary, periodic_relation, bcs_u0
-            )
-        mpc_V.finalize()
-
-        mpc_Q = MultiPointConstraint(Q0)
-        if use_topological_periodic:
-            mpc_Q.create_periodic_constraint_topological(
-                Q0, right_mt, int(slave_tag), periodic_relation, [], tol=tol
-            )
-        else:
-            mpc_Q.create_periodic_constraint_geometrical(Q0, periodic_boundary, periodic_relation, [])
-        mpc_Q.finalize()
-
-        mpc_S = MultiPointConstraint(S0)
-        if use_topological_periodic:
-            mpc_S.create_periodic_constraint_topological(
-                S0, right_mt, int(slave_tag), periodic_relation, [bc_k_wall0], tol=tol
-            )
-        else:
-            mpc_S.create_periodic_constraint_geometrical(
-                S0, periodic_boundary, periodic_relation, [bc_k_wall0]
-            )
-        mpc_S.finalize()
-
-        V = mpc_V.function_space
-        Q = mpc_Q.function_space
-        S = mpc_S.function_space
-    else:
-        V, Q, S = V0, Q0, S0
+    V, Q, S = V0, Q0, S0
 
     if comm.rank == 0:
         print(f"Velocity DOFs: {V.dofmap.index_map.size_global}", flush=True)
@@ -563,7 +457,7 @@ def solve_rans_kw(
     if use_body_force:
         f = Constant(domain, PETSc.ScalarType((1.0, 0.0)))
         if comm.rank == 0:
-            print("Using body force f_x = 1.0 (periodic channel)")
+            print("Using body force f_x = 1.0 (pressure-gradient equivalent)")
     else:
         f = Constant(domain, PETSc.ScalarType((0.0, 0.0)))
 
@@ -584,30 +478,14 @@ def solve_rans_kw(
     nu_t_.x.array[:] = np.clip(nu_t_.x.array, 0, turb.nu_t_max_factor * nu)
     nu_t_old.x.array[:] = nu_t_.x.array
 
-    # Periodic backsubstitution
-    if use_periodic:
-        mpc_V.backsubstitution(u_n)
-        mpc_V.backsubstitution(u_n1)
-        mpc_V.backsubstitution(u_)
-        mpc_S.backsubstitution(k_n)
-        mpc_S.backsubstitution(omega_n)
-        mpc_S.backsubstitution(k_)
-        mpc_S.backsubstitution(omega_)
-        mpc_S.backsubstitution(nu_t_)
-        mpc_S.backsubstitution(nu_t_old)
-
     wall_dofs_V_tb = locate_dofs_topological(V, fdim, wall_facets_tb)
     wall_dofs_S_tb = locate_dofs_topological(S, fdim, wall_facets_tb)
 
     bc_walls_u = dirichletbc(u_noslip, wall_dofs_V_tb, V)
 
     # Build velocity BCs list
-    if use_periodic:
-        # Use original-space BC objects with MPC assembly in periodic mode.
-        # Avoid reduced-space subspace dof location, which is unstable in MPI here.
-        bcu = bcs_u0
-    elif geom.use_symmetry:
-        # Add symmetry BC at top: v=0 (y-component only) for non-periodic solve loop.
+    if geom.use_symmetry:
+        # Add symmetry BC at top: v=0 (y-component only).
         # DOLFINx 0.10.0 requires Function on collapsed subspace for subspace BC
         V_y_sub = V.sub(1)
         V_y_collapsed, _ = V_y_sub.collapse()
@@ -619,12 +497,9 @@ def solve_rans_kw(
     else:
         bcu = [bc_walls_u]
 
-    if use_periodic:
-        bcp = []
-    else:
-        outlet_dofs_Q = locate_dofs_topological(Q, fdim, right_facets)
-        bc_pressure = dirichletbc(PETSc.ScalarType(0.0), outlet_dofs_Q, Q)
-        bcp = [bc_pressure]
+    outlet_dofs_Q = locate_dofs_topological(Q, fdim, right_facets)
+    bc_pressure = dirichletbc(PETSc.ScalarType(0.0), outlet_dofs_Q, Q)
+    bcp = [bc_pressure]
 
     bc_k_wall = dirichletbc(PETSc.ScalarType(0.0), wall_dofs_S_tb, S)
     bck = [bc_k_wall]
@@ -673,13 +548,8 @@ def solve_rans_kw(
 
     a_k = form(lhs(F_k))
     L_k = form(rhs(F_k))
-    if use_periodic:
-        A_k = mpc_assemble_matrix(a_k, mpc_S, bcs=bck)
-        A_k.assemble()
-        b_k = mpc_assemble_vector(L_k, mpc_S)
-    else:
-        A_k = create_matrix(a_k)
-        b_k = create_vector(S)
+    A_k = create_matrix(a_k)
+    b_k = create_vector(S)
 
     if comm.rank == 0:
         print("  k-equation forms ready", flush=True)
@@ -714,13 +584,8 @@ def solve_rans_kw(
 
     a_w = form(lhs(F_w))
     L_w = form(rhs(F_w))
-    if use_periodic:
-        A_w = mpc_assemble_matrix(a_w, mpc_S, bcs=bcw)
-        A_w.assemble()
-        b_w = mpc_assemble_vector(L_w, mpc_S)
-    else:
-        A_w = create_matrix(a_w)
-        b_w = create_vector(S)
+    A_w = create_matrix(a_w)
+    b_w = create_vector(S)
 
     if comm.rank == 0:
         print("  omega-equation forms ready", flush=True)
@@ -737,46 +602,26 @@ def solve_rans_kw(
 
     a1 = form(lhs(F1_mom))
     L1 = form(rhs(F1_mom))
-    if use_periodic:
-        A1 = mpc_assemble_matrix(a1, mpc_V, bcs=bcu)
-        A1.assemble()
-        b1 = mpc_assemble_vector(L1, mpc_V)
-    else:
-        A1 = create_matrix(a1)
-        b1 = create_vector(V)
+    A1 = create_matrix(a1)
+    b1 = create_vector(V)
 
     if comm.rank == 0:
         print("  Momentum forms ready", flush=True)
 
     a2 = form(dot(grad(p), grad(q)) * dx)
     L2 = form(-rho_c / dt_c * div(u_s) * q * dx)
-    if use_periodic:
-        A2 = mpc_assemble_matrix(a2, mpc_Q, bcs=bcp)
-        A2.assemble()
-        b2 = mpc_assemble_vector(L2, mpc_Q)
-    else:
-        A2 = assemble_matrix(a2, bcs=bcp)
-        A2.assemble()
-        b2 = create_vector(Q)
-
-    pressure_nullspace = None
-    if use_periodic:
-        pressure_nullspace = PETSc.NullSpace().create(constant=True, comm=comm)
-        A2.setNullSpace(pressure_nullspace)
+    A2 = assemble_matrix(a2, bcs=bcp)
+    A2.assemble()
+    b2 = create_vector(Q)
 
     if comm.rank == 0:
         print("  Pressure forms ready", flush=True)
 
     a3 = form(rho_c * dot(u, v) * dx)
     L3 = form(rho_c * dot(u_s, v) * dx - dt_c * dot(nabla_grad(phi), v) * dx)
-    if use_periodic:
-        A3 = mpc_assemble_matrix(a3, mpc_V, bcs=[])
-        A3.assemble()
-        b3 = mpc_assemble_vector(L3, mpc_V)
-    else:
-        A3 = assemble_matrix(a3)
-        A3.assemble()
-        b3 = create_vector(V)
+    A3 = assemble_matrix(a3)
+    A3.assemble()
+    b3 = create_vector(V)
 
     # Solvers (MPI-compatible preconditioners)
     solver_k = PETSc.KSP().create(comm)
@@ -818,38 +663,24 @@ def solve_rans_kw(
     if comm.rank == 0:
         print("  Linear solvers ready", flush=True)
 
-    def assemble_matrix_maybe_mpc(A, a, bcs, mpc):
+    def _reassemble_matrix(A, a, bcs):
         A.zeroEntries()
-        if mpc is None:
-            assemble_matrix(A, a, bcs=bcs)
-        else:
-            mpc_assemble_matrix(a, mpc, bcs=bcs, A=A)
+        assemble_matrix(A, a, bcs=bcs)
         A.assemble()
 
-    def assemble_vector_maybe_mpc(b, L, a, bcs, mpc):
+    def _reassemble_vector(b, L, a, bcs):
         with b.localForm() as loc:
             loc.set(0.0)
-        if mpc is None:
-            assemble_vector(b, L)
-            apply_lifting(b, [a], [bcs])
-        else:
-            mpc_assemble_vector(L, mpc, b)
-            mpc_apply_lifting(b, [a], [bcs], mpc)
+        assemble_vector(b, L)
+        apply_lifting(b, [a], [bcs])
         b.ghostUpdate(addv=PETSc.InsertMode.ADD_VALUES, mode=PETSc.ScatterMode.REVERSE)
         set_bc(b, bcs)
 
-    def assemble_vector_no_bc(b, L, mpc):
+    def _reassemble_vector_no_bc(b, L):
         with b.localForm() as loc:
             loc.set(0.0)
-        if mpc is None:
-            assemble_vector(b, L)
-        else:
-            mpc_assemble_vector(L, mpc, b)
+        assemble_vector(b, L)
         b.ghostUpdate(addv=PETSc.InsertMode.ADD_VALUES, mode=PETSc.ScatterMode.REVERSE)
-
-    def backsubstitute(mpc, func):
-        if mpc is not None:
-            mpc.backsubstitution(func)
 
     # Precompute wall shear stress forms (JIT compilation happens once here)
     wss_ctx = prepare_wall_shear_stress(u_, domain, nu)
@@ -938,38 +769,32 @@ def solve_rans_kw(
             # =========================================================
             if step == 1 and picard_iter == 0 and comm.rank == 0:
                 print("    Solving momentum...", flush=True)
-            assemble_matrix_maybe_mpc(A1, a1, bcu, mpc_V)
-            assemble_vector_maybe_mpc(b1, L1, a1, bcu, mpc_V)
+            _reassemble_matrix(A1, a1, bcu)
+            _reassemble_vector(b1, L1, a1, bcu)
 
             solver1.solve(b1, u_s.x.petsc_vec)
             u_s.x.scatter_forward()
-            backsubstitute(mpc_V, u_s)
 
             # =========================================================
             # STEP 2: PRESSURE CORRECTION
             # =========================================================
             if step == 1 and picard_iter == 0 and comm.rank == 0:
                 print("    Solving pressure...", flush=True)
-            assemble_vector_maybe_mpc(b2, L2, a2, bcp, mpc_Q)
-            if pressure_nullspace is not None:
-                pressure_nullspace.remove(b2)
+            _reassemble_vector(b2, L2, a2, bcp)
 
             solver2.solve(b2, phi.x.petsc_vec)
             phi.x.scatter_forward()
-            backsubstitute(mpc_Q, phi)
 
             p_.x.petsc_vec.axpy(1.0, phi.x.petsc_vec)
             p_.x.scatter_forward()
-            backsubstitute(mpc_Q, p_)
 
             # =========================================================
             # STEP 3: VELOCITY CORRECTION
             # =========================================================
-            assemble_vector_no_bc(b3, L3, mpc_V)
+            _reassemble_vector_no_bc(b3, L3)
 
             solver3.solve(b3, u_.x.petsc_vec)
             u_.x.scatter_forward()
-            backsubstitute(mpc_V, u_)
 
             if step == 1 and picard_iter == 0 and comm.rank == 0:
                 print("    Velocity correction done", flush=True)
@@ -1024,34 +849,30 @@ def solve_rans_kw(
             # =========================================================
             if step == 1 and picard_iter == 0 and comm.rank == 0:
                 print("    Solving k-equation...", flush=True)
-            assemble_matrix_maybe_mpc(A_k, a_k, bck, mpc_S)
-            assemble_vector_maybe_mpc(b_k, L_k, a_k, bck, mpc_S)
+            _reassemble_matrix(A_k, a_k, bck)
+            _reassemble_vector(b_k, L_k, a_k, bck)
 
             solver_k.solve(b_k, k_.x.petsc_vec)
             k_.x.scatter_forward()
-            backsubstitute(mpc_S, k_)
 
             k_.x.array[:] = np.clip(k_.x.array, k_min, k_max_limit)
             k_.x.array[:] = ur_kw * k_.x.array + (1.0 - ur_kw) * k_prev.x.array
             k_.x.scatter_forward()
-            backsubstitute(mpc_S, k_)
 
             # =========================================================
             # STEP 6: omega-equation (now uses updated u_n for production)
             # =========================================================
             if step == 1 and picard_iter == 0 and comm.rank == 0:
                 print("    Solving omega-equation...", flush=True)
-            assemble_matrix_maybe_mpc(A_w, a_w, bcw, mpc_S)
-            assemble_vector_maybe_mpc(b_w, L_w, a_w, bcw, mpc_S)
+            _reassemble_matrix(A_w, a_w, bcw)
+            _reassemble_vector(b_w, L_w, a_w, bcw)
 
             solver_w.solve(b_w, omega_.x.petsc_vec)
             omega_.x.scatter_forward()
-            backsubstitute(mpc_S, omega_)
 
             omega_.x.array[:] = np.clip(omega_.x.array, omega_min, omega_max_limit)
             omega_.x.array[:] = ur_kw * omega_.x.array + (1.0 - ur_kw) * omega_prev.x.array
             omega_.x.scatter_forward()
-            backsubstitute(mpc_S, omega_)
 
             # =========================================================
             # STEP 7: Update nu_t (model-dependent)
@@ -1100,7 +921,6 @@ def solve_rans_kw(
             ur_nu_t = solve.under_relax_nu_t
             nu_t_.x.array[:] = ur_nu_t * nu_t_raw + (1.0 - ur_nu_t) * nu_t_old.x.array
             nu_t_.x.scatter_forward()
-            backsubstitute(mpc_S, nu_t_)
 
             # =========================================================
             # STEP 8: Picard convergence check
