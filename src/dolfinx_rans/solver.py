@@ -99,7 +99,7 @@ from dolfinx_rans.config import (
     TurbParams,
 )
 from dolfinx_rans.geometry import (
-    compute_wall_distance_channel,
+    compute_wall_distance_eikonal,
     infer_first_offwall_spacing,
     initial_k_channel,
     initial_omega_channel,
@@ -407,7 +407,7 @@ def solve_rans_kw(
 
     # SST-specific: wall distance and blending functions
     if use_sst:
-        y_wall = compute_wall_distance_channel(S, geom.use_symmetry)
+        y_wall = compute_wall_distance_eikonal(S, wall_facets_tb)
         F1_ = Function(S, name="F1")  # Blending function (1 near wall, 0 in freestream)
         F2_ = Function(S, name="F2")  # SST limiter blending
         # Blended coefficients (will be updated each iteration)

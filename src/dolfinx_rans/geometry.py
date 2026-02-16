@@ -397,3 +397,192 @@ def compute_wall_distance_channel(S, use_symmetry: bool = True):
     y_wall.x.scatter_forward()
 
     return y_wall
+
+
+def compute_wall_distance_eikonal(S, wall_facets, relax: float = 0.01):
+    """
+    Solve Eikonal equation |grad(d)| = 1 with d = 0 on walls.
+
+    Works for any geometry. Two-step approach:
+      1. Linear Laplace warm-up: -nabla^2 d = 1,  d|_wall = 0
+      2. Nonlinear Eikonal: sqrt(grad(d).grad(d)) * v + relax * grad(d).grad(v) = v
+         solved with Newton iterations, initialized from step 1.
+
+    The relaxation term (relax * inner(grad(d), grad(v)) * dx) stabilizes the
+    nonlinear solve in regions where |grad(d)| → 0 (e.g., at symmetry planes
+    or domain corners far from walls).
+
+    Reference: joove123/k-epsilon; Tucker, P.G. (2003), Applied Mathematical
+    Modelling, 27(3):189-198.
+
+    Args:
+        S: Scalar function space (Lagrange 1)
+        wall_facets: Array of facet indices on wall boundaries
+        relax: Diffusive regularization coefficient (default 0.01)
+
+    Returns:
+        d: Function containing wall distance at each DOF
+    """
+    import ufl
+    from dolfinx.fem import (
+        Constant,
+        Function,
+        dirichletbc,
+        form,
+        locate_dofs_topological,
+    )
+    from dolfinx.fem.petsc import (
+        apply_lifting,
+        assemble_matrix,
+        assemble_vector,
+        create_matrix,
+        create_vector,
+        set_bc,
+    )
+
+    domain = S.mesh
+    comm = domain.comm
+    fdim = domain.topology.dim - 1
+    domain.topology.create_connectivity(fdim, domain.topology.dim)
+
+    # Wall Dirichlet BC: d = 0
+    wall_dofs = locate_dofs_topological(S, fdim, wall_facets)
+    bc_wall = dirichletbc(PETSc.ScalarType(0.0), wall_dofs, S)
+    bcs = [bc_wall]
+
+    # ─── Step 1: Linear Laplace warm-up ───
+    # Solve -nabla^2 d = 1 with d = 0 on walls.
+    # This gives a smooth, positive approximation to wall distance.
+    d = Function(S, name="wall_distance")
+    d_trial = ufl.TrialFunction(S)
+    v = ufl.TestFunction(S)
+
+    a_lap = form(ufl.inner(ufl.grad(d_trial), ufl.grad(v)) * ufl.dx)
+    L_lap = form(Constant(domain, PETSc.ScalarType(1.0)) * v * ufl.dx)
+
+    A_lap = create_matrix(a_lap)
+    assemble_matrix(A_lap, a_lap, bcs=bcs)
+    A_lap.assemble()
+
+    b_lap = create_vector(S)
+    with b_lap.localForm() as loc:
+        loc.set(0.0)
+    assemble_vector(b_lap, L_lap)
+    apply_lifting(b_lap, [a_lap], [bcs])
+    b_lap.ghostUpdate(addv=PETSc.InsertMode.ADD_VALUES, mode=PETSc.ScatterMode.REVERSE)
+    set_bc(b_lap, bcs)
+
+    ksp_lap = PETSc.KSP().create(comm)
+    ksp_lap.setOperators(A_lap)
+    ksp_lap.setType(PETSc.KSP.Type.CG)
+    pc = ksp_lap.getPC()
+    pc.setType(PETSc.PC.Type.HYPRE)
+    pc.setHYPREType("boomeramg")
+    ksp_lap.setTolerances(rtol=1e-10)
+    ksp_lap.solve(b_lap, d.x.petsc_vec)
+    d.x.scatter_forward()
+
+    # Ensure non-negative (Laplace solution should be positive, but clip for safety)
+    d.x.array[:] = np.maximum(d.x.array, 0.0)
+    d.x.scatter_forward()
+
+    ksp_lap.destroy()
+    A_lap.destroy()
+    b_lap.destroy()
+
+    if comm.rank == 0:
+        print(
+            f"Eikonal warm-up (Laplace): d_max = {float(comm.allreduce(np.max(d.x.array), op=MPI.MAX)):.4f}",
+            flush=True,
+        )
+
+    # ─── Step 2: Nonlinear Eikonal solve ───
+    # F(d) = sqrt(grad(d).grad(d)) * v + relax * grad(d).grad(v) - v = 0
+    # Uses Picard iteration: linearize |grad(d)| around current d.
+    #
+    # We avoid the full Newton since |grad(d)| has a singularity at grad(d)=0.
+    # Instead: fixed-point iteration updating |grad(d)| from previous iterate.
+    relax_c = Constant(domain, PETSc.ScalarType(relax))
+    one_c = Constant(domain, PETSc.ScalarType(1.0))
+
+    d_old = Function(S)
+    d_old.x.array[:] = d.x.array
+
+    d_new = ufl.TrialFunction(S)
+    v_test = ufl.TestFunction(S)
+
+    # |grad(d_old)| as linearization point
+    grad_d_old_sq = ufl.dot(ufl.grad(d_old), ufl.grad(d_old))
+    grad_d_old_mag = ufl.sqrt(grad_d_old_sq + 1e-16)
+
+    # Linearized Eikonal: |grad(d_old)| * d_new/d_old_approx ≈ 1
+    # Better form: grad(d_old)/|grad(d_old)| . grad(d_new) + relax * laplacian = 1
+    # This is the standard Picard linearization of the Eikonal equation.
+    n_hat = ufl.grad(d_old) / grad_d_old_mag  # unit normal direction
+    a_eik = form(
+        ufl.dot(n_hat, ufl.grad(d_new)) * v_test * ufl.dx
+        + relax_c * ufl.inner(ufl.grad(d_new), ufl.grad(v_test)) * ufl.dx
+    )
+    L_eik = form(one_c * v_test * ufl.dx)
+
+    A_eik = create_matrix(a_eik)
+    b_eik = create_vector(S)
+
+    ksp_eik = PETSc.KSP().create(comm)
+    ksp_eik.setOperators(A_eik)
+    ksp_eik.setType(PETSc.KSP.Type.BCGS)
+    pc_eik = ksp_eik.getPC()
+    pc_eik.setType(PETSc.PC.Type.HYPRE)
+    pc_eik.setHYPREType("boomeramg")
+    ksp_eik.setTolerances(rtol=1e-8)
+
+    max_eik_iter = 30
+    eik_tol = 1e-4
+    for it in range(max_eik_iter):
+        A_eik.zeroEntries()
+        assemble_matrix(A_eik, a_eik, bcs=bcs)
+        A_eik.assemble()
+
+        with b_eik.localForm() as loc:
+            loc.set(0.0)
+        assemble_vector(b_eik, L_eik)
+        apply_lifting(b_eik, [a_eik], [bcs])
+        b_eik.ghostUpdate(addv=PETSc.InsertMode.ADD_VALUES, mode=PETSc.ScatterMode.REVERSE)
+        set_bc(b_eik, bcs)
+
+        ksp_eik.solve(b_eik, d.x.petsc_vec)
+        d.x.scatter_forward()
+
+        # Ensure non-negative
+        d.x.array[:] = np.maximum(d.x.array, 0.0)
+        d.x.scatter_forward()
+
+        # Check convergence: relative change in d
+        diff = d.x.array - d_old.x.array
+        diff_norm = float(np.sqrt(comm.allreduce(np.dot(diff, diff), op=MPI.SUM)))
+        d_norm = float(np.sqrt(comm.allreduce(np.dot(d.x.array, d.x.array), op=MPI.SUM)))
+        rel_change = diff_norm / max(d_norm, 1e-10)
+
+        d_old.x.array[:] = d.x.array
+
+        if rel_change < eik_tol:
+            if comm.rank == 0:
+                print(f"Eikonal converged in {it + 1} iterations (rel_change = {rel_change:.2e})", flush=True)
+            break
+    else:
+        if comm.rank == 0:
+            print(
+                f"Eikonal: max iterations ({max_eik_iter}) reached "
+                f"(rel_change = {rel_change:.2e})",
+                flush=True,
+            )
+
+    ksp_eik.destroy()
+    A_eik.destroy()
+    b_eik.destroy()
+
+    # Final floor for numerical safety in turbulence models
+    d.x.array[:] = np.maximum(d.x.array, 1e-10)
+    d.x.scatter_forward()
+
+    return d
