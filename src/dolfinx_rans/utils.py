@@ -246,48 +246,6 @@ class HistoryWriterCSV:
                 self._writer = None
 
 
-def compute_wall_distance_channel(S, use_symmetry: bool = True):
-    """
-    Compute wall distance for channel flow geometry.
-
-    For channel flow:
-    - Half-channel (use_symmetry=True): wall at y=0, symmetry at y=Ly
-      → wall distance = y
-    - Full channel (use_symmetry=False): walls at y=0 and y=Ly
-      → wall distance = min(y, Ly-y)
-
-    Args:
-        S: Scalar function space
-        use_symmetry: True for half-channel, False for full channel
-
-    Returns:
-        y_wall: Function containing wall distance at each DOF
-    """
-    from dolfinx.fem import Function
-    import numpy as np
-
-    domain = S.mesh
-    y_wall = Function(S, name="wall_distance")
-
-    # Get DOF coordinates
-    x_dofs = S.tabulate_dof_coordinates()
-    y_coords = x_dofs[:, 1]
-
-    if use_symmetry:
-        # Half-channel: wall at y=0, wall distance = y
-        y_wall.x.array[:] = y_coords
-    else:
-        # Full channel: walls at y=0 and y=Ly
-        Ly = np.max(y_coords)
-        y_wall.x.array[:] = np.minimum(y_coords, Ly - y_coords)
-
-    # Ensure positive (minimum distance = small epsilon for numerical stability)
-    y_wall.x.array[:] = np.maximum(y_wall.x.array, 1e-10)
-    y_wall.x.scatter_forward()
-
-    return y_wall
-
-
 def prepare_wall_shear_stress(u, domain, nu: float, wall_tag: int = 1):
     """
     Precompute forms for wall shear stress evaluation.

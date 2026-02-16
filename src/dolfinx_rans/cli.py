@@ -12,14 +12,14 @@ from pathlib import Path
 
 from mpi4py import MPI
 
-from dolfinx_rans.solver import (
+from dolfinx_rans.config import (
     ChannelGeom,
     NondimParams,
     SolveParams,
     TurbParams,
-    create_channel_mesh,
-    solve_rans_kw,
 )
+from dolfinx_rans.geometry import create_channel_mesh
+from dolfinx_rans.solver import solve_rans_kw
 from dolfinx_rans.utils import (
     compute_bulk_velocity,
     dc_from_dict,
@@ -50,9 +50,15 @@ def _resolve_reference_profile_csv(cfg: dict, cfg_path: Path) -> Path | None:
         return None
 
     # Default convenience path for the re100k workflow.
-    auto = (cfg_path.parent.parent / "nek_re100k" / "nek_to_csv.csv").resolve()
-    if auto.exists():
-        return auto
+    base = cfg_path.parent.parent / "nek_re100k"
+    candidates = [
+        base / "nek_profile_outer.csv",
+        base / "nek_to_csv.csv",
+        base / "nek_to_csv_symmetry.csv",
+    ]
+    for auto in candidates:
+        if auto.exists():
+            return auto
     return None
 
 

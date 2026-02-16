@@ -18,14 +18,14 @@ Example:
 
 __version__ = "0.1.0"
 
-from dolfinx_rans.solver import (
+from dolfinx_rans.config import (
     ChannelGeom,
     NondimParams,
-    TurbParams,
     SolveParams,
-    create_channel_mesh,
-    solve_rans_kw,
+    TurbParams,
 )
+from dolfinx_rans.geometry import create_channel_mesh
+from dolfinx_rans.solver import solve_rans_kw
 
 __all__ = [
     "__version__",

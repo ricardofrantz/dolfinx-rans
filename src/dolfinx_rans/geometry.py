@@ -1,0 +1,399 @@
+"""
+Geometry, mesh generation, boundary marking, and initial conditions for dolfinx-rans.
+
+Contains:
+- Channel mesh creation with wall refinement (geometric/tanh stretching)
+- Boundary marking for channel flow
+- Initial condition profiles (velocity, k, omega)
+- Wall distance computation (channel-specific and Eikonal PDE)
+"""
+
+import numpy as np
+from mpi4py import MPI
+from petsc4py import PETSc
+
+from dolfinx import mesh
+from dolfinx.mesh import CellType
+
+from dolfinx_rans.config import BETA_0, ChannelGeom
+
+
+# =============================================================================
+# Mesh utilities
+# =============================================================================
+
+
+def create_channel_mesh(geom: ChannelGeom, Re_tau: float = None):
+    """
+    Create channel mesh with optional wall refinement.
+
+    If geom.use_symmetry=True (default), creates half-channel [0, delta] with:
+      - Bottom (y=0): wall (no-slip)
+      - Top (y=delta): symmetry (free-slip, du/dy=0)
+
+    If geom.use_symmetry=False, creates full channel [0, 2*delta] with walls on both sides.
+
+    Args:
+        geom: Channel geometry parameters
+        Re_tau: Friction Reynolds number (for y+ reporting)
+    """
+    comm = MPI.COMM_WORLD
+    if geom.y_first_tol_rel < 0:
+        raise ValueError(f"geom.y_first_tol_rel must be >= 0, got {geom.y_first_tol_rel}")
+    stretching = geom.stretching.lower()
+    if stretching not in {"geometric", "tanh"}:
+        raise ValueError(
+            f"Unknown geom.stretching='{geom.stretching}'. Expected 'geometric' or 'tanh'."
+        )
+
+    use_stretched = geom.y_first > 0 and (stretching == "tanh" or geom.growth_rate > 1.0)
+    if use_stretched:
+        # Wall-refined mesh
+        Ny = geom.Ny
+        Ly = geom.Ly
+
+        if geom.use_symmetry:
+            # Half-channel: only [0, Ly] with wall at bottom, symmetry at top
+            y_coords = _generate_stretched_coords(
+                y_first=geom.y_first,
+                H=Ly,
+                N=Ny,
+                growth=geom.growth_rate,
+                stretching=stretching,
+            )
+            if comm.rank == 0:
+                print(f"Half-channel (symmetry at y={Ly:.2f})")
+        else:
+            # Full channel: [0, Ly] with walls at both ends
+            H = Ly / 2.0  # Half-height
+            y_lower = _generate_stretched_coords(
+                y_first=geom.y_first,
+                H=H,
+                N=Ny // 2,
+                growth=geom.growth_rate,
+                stretching=stretching,
+            )
+            y_upper = Ly - y_lower[::-1]
+            y_coords = np.concatenate([y_lower, y_upper[1:]])
+            if comm.rank == 0:
+                print(f"Full channel (walls at y=0 and y={Ly:.2f})")
+
+        # Report first off-wall spacing actually used by the stretched mesh
+        y_first_actual = float(y_coords[1] - y_coords[0])
+        rel_err = abs(y_first_actual - geom.y_first) / max(abs(geom.y_first), 1e-16)
+        if rel_err > geom.y_first_tol_rel:
+            raise ValueError(
+                "Inconsistent wall spacing settings: "
+                f"requested y_first={geom.y_first:.6e}, implied by (Ly,Ny,growth)={y_first_actual:.6e}, "
+                f"relative error={100.0 * rel_err:.1f}% exceeds tolerance "
+                f"{100.0 * geom.y_first_tol_rel:.1f}%. "
+                "Adjust Ny/growth_rate or set y_first to match the implied spacing."
+            )
+
+        # Report y+ at first off-wall point
+        if comm.rank == 0 and Re_tau is not None:
+            y_plus_first = y_first_actual * Re_tau
+            print(
+                "Wall-refined mesh: "
+                f"mode = {stretching}, "
+                f"y_first(requested) = {geom.y_first:.6f}, "
+                f"y_first(actual) = {y_first_actual:.6f}, "
+                f"y+_actual = {y_plus_first:.2f}"
+            )
+            if y_plus_first > 2.5:
+                print("  WARNING: y+ > 2.5, low-Re wall BC may be inaccurate")
+
+        # Create mesh with stretched coordinates
+        domain = _create_stretched_mesh(geom.Lx, Ly, geom.Nx, Ny, y_coords, geom.mesh_type)
+    else:
+        # Uniform mesh
+        if geom.mesh_type == "triangle":
+            domain = mesh.create_rectangle(
+                comm,
+                [[0.0, 0.0], [geom.Lx, geom.Ly]],
+                [geom.Nx, geom.Ny],
+                cell_type=CellType.triangle,
+            )
+        else:
+            domain = mesh.create_rectangle(
+                comm,
+                [[0.0, 0.0], [geom.Lx, geom.Ly]],
+                [geom.Nx, geom.Ny],
+                cell_type=CellType.quadrilateral,
+            )
+
+        if comm.rank == 0 and Re_tau is not None:
+            dy = geom.Ly / geom.Ny
+            y_plus_first = (dy / 2) * Re_tau
+            print(f"Uniform mesh: dy = {dy:.6f}, y+ ~ {y_plus_first:.1f} at first cell center")
+            if y_plus_first > 2.5:
+                print("  WARNING: y+ > 2.5, consider using growth_rate > 1 for wall refinement")
+
+    return domain
+
+
+def _generate_stretched_coords(
+    y_first: float,
+    H: float,
+    N: int,
+    growth: float,
+    stretching: str,
+) -> np.ndarray:
+    """Generate stretched y-coordinates with the requested stretching mode."""
+    if stretching == "geometric":
+        return _generate_stretched_coords_geometric(H, N, growth)
+    if stretching == "tanh":
+        return _generate_stretched_coords_tanh(y_first, H, N)
+    raise ValueError(f"Unsupported stretching mode: {stretching}")
+
+
+def _generate_stretched_coords_geometric(H: float, N: int, growth: float) -> np.ndarray:
+    """
+    Generate geometrically stretched y-coordinates from wall to midplane.
+
+    With fixed (H, N, growth), the first spacing is determined by the
+    geometric-series closure.
+    """
+    if growth == 1.0:
+        return np.linspace(0, H, N + 1)
+
+    # Compute first cell size to exactly fill H with N cells at given growth rate
+    # Geometric series sum: H = dy1 * (growth^N - 1) / (growth - 1)
+    sum_factor = (growth**N - 1) / (growth - 1)
+    y_first_actual = H / sum_factor
+
+    # Generate coordinates
+    y = np.zeros(N + 1)
+    y[0] = 0.0
+    dy = y_first_actual
+    for i in range(1, N + 1):
+        y[i] = y[i - 1] + dy
+        dy *= growth
+
+    y[-1] = H  # Ensure exact endpoint
+    return y
+
+
+def _generate_stretched_coords_tanh(y_first: float, H: float, N: int) -> np.ndarray:
+    """
+    Generate wall-refined coordinates using:
+        y(eta) = H * [1 - tanh(beta*(1-eta))/tanh(beta)], eta in [0,1]
+    and solve beta so that the first spacing matches y_first.
+    """
+    if N <= 0:
+        raise ValueError(f"N must be > 0 for tanh stretching, got {N}")
+    if y_first <= 0 or y_first >= H:
+        raise ValueError(f"tanh stretching requires 0 < y_first < H, got y_first={y_first}, H={H}")
+
+    dy_uniform = H / N
+    if y_first >= dy_uniform:
+        return np.linspace(0, H, N + 1)
+
+    eta = np.linspace(0.0, 1.0, N + 1)
+
+    def dy1(beta: float) -> float:
+        return H * (1.0 - np.tanh(beta * (1.0 - 1.0 / N)) / np.tanh(beta))
+
+    beta_lo = 1e-12
+    beta_hi = 1.0
+    while dy1(beta_hi) > y_first:
+        beta_hi *= 2.0
+        if beta_hi > 1e6:
+            raise ValueError(
+                "Could not match requested y_first with tanh stretching. "
+                f"Requested y_first={y_first:.6e}, H={H:.6e}, N={N}."
+            )
+
+    for _ in range(80):
+        beta_mid = 0.5 * (beta_lo + beta_hi)
+        if dy1(beta_mid) > y_first:
+            beta_lo = beta_mid
+        else:
+            beta_hi = beta_mid
+
+    beta = 0.5 * (beta_lo + beta_hi)
+    y = H * (1.0 - np.tanh(beta * (1.0 - eta)) / np.tanh(beta))
+    y[0] = 0.0
+    y[-1] = H
+    return y
+
+
+def _create_stretched_mesh(Lx: float, Ly: float, Nx: int, Ny: int, y_coords: np.ndarray, mesh_type: str):
+    """Create mesh with stretched y-coordinates by deforming a uniform mesh."""
+    # Create uniform mesh first
+    if mesh_type == "triangle":
+        cell_type = CellType.triangle
+    else:
+        cell_type = CellType.quadrilateral
+
+    domain = mesh.create_rectangle(
+        MPI.COMM_WORLD,
+        [[0.0, 0.0], [Lx, Ly]],
+        [Nx, Ny],
+        cell_type=cell_type,
+    )
+
+    # Deform mesh: map uniform y to stretched y
+    x = domain.geometry.x
+    y_uniform = np.linspace(0, Ly, Ny + 1)
+
+    for i in range(x.shape[0]):
+        y_old = x[i, 1]
+        # Find which interval y_old falls into and interpolate
+        idx = np.searchsorted(y_uniform, y_old, side="right") - 1
+        idx = max(0, min(idx, Ny - 1))
+        # Linear interpolation within the cell
+        t = (y_old - y_uniform[idx]) / (y_uniform[idx + 1] - y_uniform[idx]) if y_uniform[idx + 1] != y_uniform[idx] else 0
+        x[i, 1] = y_coords[idx] + t * (y_coords[idx + 1] - y_coords[idx])
+
+    return domain
+
+
+# =============================================================================
+# Boundary marking
+# =============================================================================
+
+
+def mark_channel_boundaries(domain, Lx: float, Ly: float):
+    """
+    Mark channel boundaries and return BoundaryInfo.
+
+    Returns both the raw facet arrays (bottom, top, left, right) and a
+    BoundaryInfo object with semantic names (wall, inlet, outlet, symmetry).
+    """
+    fdim = domain.topology.dim - 1
+    tol = 1e-10
+
+    def bottom(x):
+        return np.isclose(x[1], 0.0, atol=tol)
+
+    def top(x):
+        return np.isclose(x[1], Ly, atol=tol)
+
+    def left(x):
+        return np.isclose(x[0], 0.0, atol=tol)
+
+    def right(x):
+        return np.isclose(x[0], Lx, atol=tol)
+
+    bottom_facets = mesh.locate_entities_boundary(domain, fdim, bottom)
+    top_facets = mesh.locate_entities_boundary(domain, fdim, top)
+    left_facets = mesh.locate_entities_boundary(domain, fdim, left)
+    right_facets = mesh.locate_entities_boundary(domain, fdim, right)
+    return bottom_facets, top_facets, left_facets, right_facets
+
+
+def infer_first_offwall_spacing(domain, Ly: float, use_symmetry: bool, tol: float = 1e-12) -> float:
+    """
+    Infer first off-wall spacing directly from mesh coordinates.
+
+    For half-channel this is min(y > 0).
+    For full channel this is min(min(y, Ly-y) > 0).
+    """
+    y = domain.geometry.x[:, 1]
+    if use_symmetry:
+        wall_distance = y
+    else:
+        wall_distance = np.minimum(y, Ly - y)
+
+    positive = wall_distance[wall_distance > tol]
+    local_min = float(np.min(positive)) if positive.size > 0 else np.inf
+    y_first = float(domain.comm.allreduce(local_min, op=MPI.MIN))
+    if not np.isfinite(y_first):
+        raise RuntimeError("Could not infer first off-wall spacing from mesh geometry.")
+    return y_first
+
+
+# =============================================================================
+# Initial conditions
+# =============================================================================
+
+
+def initial_velocity_channel(x, u_bulk: float, Ly: float, use_symmetry: bool = True):
+    """Parabolic initial velocity profile.
+
+    For half-channel (use_symmetry=True): y in [0, delta], u = u_max * (1 - (1-y/delta)^2)
+    For full channel: y in [0, 2*delta], u = u_max * (1 - (y/delta - 1)^2)
+    """
+    if use_symmetry:
+        # Half-channel: y=0 is wall, y=Ly is centerline
+        # u = 0 at y=0, u = u_max at y=Ly
+        eta = x[1] / Ly  # eta in [0, 1]
+        u_profile = 1.5 * u_bulk * (2*eta - eta**2)  # parabolic: 0 at wall, max at center
+    else:
+        # Full channel: y=0 and y=Ly are walls, centerline at y=Ly/2
+        eta = 2.0 * x[1] / Ly - 1.0  # eta in [-1, 1]
+        u_profile = 1.5 * u_bulk * (1.0 - eta**2)
+    return np.vstack([u_profile, np.zeros(x.shape[1], dtype=PETSc.ScalarType)])
+
+
+def initial_k_channel(x, u_bulk: float, intensity: float = 0.05):
+    """Initial TKE from turbulence intensity."""
+    k_val = 1.5 * (intensity * u_bulk) ** 2
+    return np.full(x.shape[1], max(k_val, 1e-8), dtype=PETSc.ScalarType)
+
+
+def initial_omega_channel(x, u_bulk: float, H: float, nu: float):
+    """Initial omega profile blended from wall asymptotic to bulk value."""
+    k_val = max(1.5 * (0.05 * u_bulk) ** 2, 1e-8)
+    l_mix = 0.07 * H
+    omega_bulk = np.sqrt(k_val) / l_mix
+
+    y = x[1]
+    Ly = 2 * H
+    y_wall = np.minimum(y, Ly - y)
+    y_wall = np.maximum(y_wall, 1e-10)
+
+    omega_wall = 6.0 * nu / (BETA_0 * y_wall**2)
+    omega_wall = np.minimum(omega_wall, 1e8)
+
+    blend = np.tanh(y_wall / (0.1 * H)) ** 2
+    omega = (1 - blend) * omega_wall + blend * omega_bulk
+
+    return np.maximum(omega, 1e-6).astype(PETSc.ScalarType)
+
+
+# =============================================================================
+# Wall distance computation
+# =============================================================================
+
+
+def compute_wall_distance_channel(S, use_symmetry: bool = True):
+    """
+    Compute wall distance for channel flow geometry.
+
+    For channel flow:
+    - Half-channel (use_symmetry=True): wall at y=0, symmetry at y=Ly
+      -> wall distance = y
+    - Full channel (use_symmetry=False): walls at y=0 and y=Ly
+      -> wall distance = min(y, Ly-y)
+
+    Args:
+        S: Scalar function space
+        use_symmetry: True for half-channel, False for full channel
+
+    Returns:
+        y_wall: Function containing wall distance at each DOF
+    """
+    from dolfinx.fem import Function
+
+    domain = S.mesh
+    y_wall = Function(S, name="wall_distance")
+
+    # Get DOF coordinates
+    x_dofs = S.tabulate_dof_coordinates()
+    y_coords = x_dofs[:, 1]
+
+    if use_symmetry:
+        # Half-channel: wall at y=0, wall distance = y
+        y_wall.x.array[:] = y_coords
+    else:
+        # Full channel: walls at y=0 and y=Ly
+        Ly = np.max(y_coords)
+        y_wall.x.array[:] = np.minimum(y_coords, Ly - y_coords)
+
+    # Ensure positive (minimum distance = small epsilon for numerical stability)
+    y_wall.x.array[:] = np.maximum(y_wall.x.array, 1e-10)
+    y_wall.x.scatter_forward()
+
+    return y_wall
