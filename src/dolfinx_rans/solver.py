@@ -539,7 +539,7 @@ def solve_rans_kw(
     if is_bfs:
         u_n.interpolate(lambda x: initial_velocity_bfs(x, u_bulk_init, Ly, H))
         k_n.interpolate(lambda x: initial_k_bfs(x, u_bulk_init))
-        omega_n.interpolate(lambda x: initial_omega_bfs(x, u_bulk_init, H))
+        omega_n.interpolate(lambda x: initial_omega_bfs(x, u_bulk_init, H, nu=nu, H_outlet=Ly))
     else:
         u_n.interpolate(lambda x: initial_velocity_channel(x, u_bulk_init, Ly, geom.use_symmetry))
         k_n.interpolate(lambda x: initial_k_channel(x, u_bulk_init))
@@ -621,7 +621,13 @@ def solve_rans_kw(
 
     S_tensor = sym(grad(u_n))
     S_sq = 2.0 * inner(S_tensor, S_tensor)
-    P_k = nu_t_ * S_sq
+    # Production limiter: P_k <= 10*beta_star*k*omega (Wilcox 2006, Menter SST).
+    # Prevents runaway production in stagnation/recirculation zones where omega
+    # is small and |S| is large.  Uses k_n (prev timestep) and omega_prev as
+    # the reference — consistent with the Picard linearization.
+    P_k_raw = nu_t_ * S_sq
+    P_k_cap = 10.0 * beta_star_c * k_n * omega_safe
+    P_k = ufl.min_value(P_k_raw, P_k_cap)
 
     # S_mag expression for stress limiter: |S| = sqrt(2*S_ij*S_ij)
     S_mag_ufl = sqrt(S_sq + 1e-16)
@@ -690,11 +696,21 @@ def solve_rans_kw(
     nu_eff = nu_c + nu_t_
     mu_eff = rho_c * nu_eff
 
-    F1_mom = rho_c / dt_c * dot(u - u_n, v) * dx
-    F1_mom += inner(dot(1.5 * u_n - 0.5 * u_n1, 0.5 * nabla_grad(u + u_n)), v) * dx
-    F1_mom += 0.5 * mu_eff * inner(grad(u + u_n), grad(v)) * dx
-    F1_mom -= dot(p_, div(v)) * dx
-    F1_mom -= dot(f, v) * dx
+    # BFS uses first-order Picard linearization (unconditionally stable,
+    # allows large dt for pseudo-steady-state marching).
+    # Channel uses AB2/CN (second-order, CFL-limited but time-accurate).
+    if is_bfs:
+        F1_mom = rho_c / dt_c * dot(u - u_n, v) * dx
+        F1_mom += inner(dot(u_n, nabla_grad(u)), v) * dx
+        F1_mom += mu_eff * inner(grad(u), grad(v)) * dx
+        F1_mom -= dot(p_, div(v)) * dx
+        F1_mom -= dot(f, v) * dx
+    else:
+        F1_mom = rho_c / dt_c * dot(u - u_n, v) * dx
+        F1_mom += inner(dot(1.5 * u_n - 0.5 * u_n1, 0.5 * nabla_grad(u + u_n)), v) * dx
+        F1_mom += 0.5 * mu_eff * inner(grad(u + u_n), grad(v)) * dx
+        F1_mom -= dot(p_, div(v)) * dx
+        F1_mom -= dot(f, v) * dx
 
     a1 = form(lhs(F1_mom))
     L1 = form(rhs(F1_mom))
@@ -833,6 +849,7 @@ def solve_rans_kw(
     alpha_u = 0.7  # velocity under-relaxation factor
 
     u_n_old = np.empty_like(u_n.x.array)
+    u_n_picard = np.empty_like(u_n.x.array)  # Picard reference (advances each iteration)
 
     def field_residual(new_arr, old_arr):
         diff = new_arr - old_arr
@@ -855,6 +872,7 @@ def solve_rans_kw(
         # Save old values for residual computation and under-relaxation
         # (u_n will be updated inside Picard loop, so save it here)
         u_n_old[:] = u_n.x.array  # For residual: compare u_new vs u_old
+        u_n_picard[:] = u_n.x.array  # Picard reference (advances each iteration)
         k_prev.x.array[:] = k_n.x.array
         omega_prev.x.array[:] = omega_n.x.array
         nu_t_old.x.array[:] = nu_t_.x.array
@@ -896,12 +914,13 @@ def solve_rans_kw(
                 print("    Velocity correction done", flush=True)
 
             # =========================================================
-            # STEP 4: UPDATE u_n WITH UNDER-RELAXATION
-            # This ensures turbulence equations use fresh velocity,
-            # but under-relaxation prevents instability from large changes
+            # STEP 4: UPDATE u_n WITH UNDER-RELAXATION (Picard)
+            # Blend with previous Picard iterate, NOT start-of-timestep.
+            # This allows the Picard loop to converge monotonically.
             # =========================================================
-            u_n.x.array[:] = alpha_u * u_.x.array + (1.0 - alpha_u) * u_n_old
+            u_n.x.array[:] = alpha_u * u_.x.array + (1.0 - alpha_u) * u_n_picard
             u_n.x.scatter_forward()
+            u_n_picard[:] = u_n.x.array  # Advance reference for next Picard iteration
 
             # =========================================================
             # STEP 4b: Update SST blending functions BEFORE k/omega solves
@@ -1144,12 +1163,17 @@ def solve_rans_kw(
                 print(f"\n*** CONVERGED at iteration {step} (residual = {residual:.2e}) ***")
             break
 
-        # Adaptive dt
+        # Adaptive dt: grow when residual is monotonically decreasing,
+        # shrink when residual grows more than 5% per step.
+        # The asymmetric thresholds prevent sawtooth dt oscillation:
+        # growth requires a clear decrease, but shrink tolerates small
+        # fluctuations from Picard under-relaxation and transient dynamics.
         residual_ratio = residual / max(residual_prev, 1e-15)
         if residual_ratio < solve.dt_growth_threshold:
             current_dt = min(current_dt * solve.dt_growth, solve.dt_max)
-        elif residual_ratio > 1.0 / solve.dt_growth_threshold:
-            current_dt = max(current_dt / solve.dt_growth, solve.dt)
+        elif residual_ratio > 1.05:
+            # Residual growing → halve dt for recovery
+            current_dt = max(current_dt * 0.5, solve.dt)
         residual_prev = residual
 
     # Final snapshot

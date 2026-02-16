@@ -216,12 +216,10 @@ class HistoryWriterCSV:
             return
 
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        new_file = not self.path.exists()
-        self._fh = open(self.path, "a", newline="")
+        self._fh = open(self.path, "w", newline="")
         self._writer = csv.DictWriter(self._fh, fieldnames=self.fieldnames)
-        if new_file:
-            self._writer.writeheader()
-            self._fh.flush()
+        self._writer.writeheader()
+        self._fh.flush()
 
     def write(self, row: Mapping[str, object]) -> None:
         if not self.enabled or self._writer is None or self._fh is None:

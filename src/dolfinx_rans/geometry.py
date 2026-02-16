@@ -781,9 +781,32 @@ def initial_k_bfs(x, U_inlet, intensity=0.05):
     return np.full(x.shape[1], k_val, dtype=PETSc.ScalarType)
 
 
-def initial_omega_bfs(x, U_inlet, H_inlet):
-    """Uniform initial omega for BFS from mixing-length estimate."""
+def initial_omega_bfs(x, U_inlet, H_inlet, nu=0.0, H_outlet=0.0):
+    """Wall-blended initial omega for BFS.
+
+    Blends from the wall-asymptotic value omega_wall = 6*nu/(beta_0*y_w^2)
+    near walls to a mixing-length bulk estimate in the interior.  This
+    avoids the sharp jump between a uniform IC and the Dirichlet omega_wall
+    BC that previously caused early-iteration instability.
+
+    When nu=0 (legacy call), falls back to uniform mixing-length estimate.
+    """
     k_val = max(1.5 * (0.05 * U_inlet) ** 2, 1e-8)
     l_mix = 0.07 * H_inlet
-    omega_val = np.sqrt(k_val) / max(l_mix, 1e-10)
-    return np.full(x.shape[1], omega_val, dtype=PETSc.ScalarType)
+    omega_bulk = np.sqrt(k_val) / max(l_mix, 1e-10)
+
+    if nu <= 0.0 or H_outlet <= 0.0:
+        return np.full(x.shape[1], omega_bulk, dtype=PETSc.ScalarType)
+
+    # Wall distance: min distance to bottom (y=0) or top (y=H_outlet) wall
+    y_wall = np.minimum(x[1], H_outlet - x[1])
+    y_wall = np.maximum(y_wall, 1e-10)
+
+    omega_wall = 6.0 * nu / (BETA_0 * y_wall**2)
+    omega_wall = np.minimum(omega_wall, 1e8)  # Cap near-wall singularity
+
+    # Smooth blend: tanh² transition over ~10% of inlet height
+    blend = np.tanh(y_wall / (0.1 * H_inlet)) ** 2
+    omega = (1.0 - blend) * omega_wall + blend * omega_bulk
+
+    return np.maximum(omega, 1e-6).astype(PETSc.ScalarType)
