@@ -657,8 +657,7 @@ def _tricontour(ax, x, y, vals, label, geom=None, n_levels=32):
 def plot_convergence(history_file: Path, save_path: Path | None = None):
     """Plot convergence history from CSV file.
 
-    Shows residuals for each equation (momentum, k, omega) on log scale.
-    This is the standard way to monitor CFD solver convergence.
+    Single figure: residuals on left y-axis (log), dt/CFL_max on right y-axis (linear).
     """
     if MPI.COMM_WORLD.rank != 0:
         return
@@ -666,48 +665,45 @@ def plot_convergence(history_file: Path, save_path: Path | None = None):
     import csv
 
     # Read history
-    data = {
-        "iter": [],
-        "dt": [],
-        "res_u": [],
-        "res_k": [],
-        "res_w": [],
+    data: dict[str, list[float]] = {
+        "iter": [], "dt": [], "res_u": [], "res_k": [], "res_w": [], "cfl_max": [],
     }
     with open(history_file) as f:
         reader = csv.DictReader(f)
         for row in reader:
             data["iter"].append(int(row["iter"]))
             data["dt"].append(float(row["dt"]))
-            # Individual equation residuals
             data["res_u"].append(float(row.get("res_u", row.get("residual", 1.0))))
             data["res_k"].append(float(row.get("res_k", 1.0)))
             data["res_w"].append(float(row.get("res_w", 1.0)))
+            cfl = row.get("cfl_max", "")
+            data["cfl_max"].append(float(cfl) if cfl else 0.0)
 
     iters = data["iter"]
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    fig, ax = plt.subplots(figsize=(10, 5))
 
-    # Residual history - each equation separately
-    ax = axes[0]
+    # Left y-axis: residuals (log scale)
     ax.semilogy(iters, data["res_u"], "b-", linewidth=1.2, label="Momentum (u)")
     ax.semilogy(iters, data["res_k"], "r-", linewidth=1.2, label="TKE (k)")
-    ax.semilogy(iters, data["res_w"], "g-", linewidth=1.2, label="Omega (ω)")
+    ax.semilogy(iters, data["res_w"], "g-", linewidth=1.2, label=r"Omega ($\omega$)")
     ax.set_xlabel("Iteration")
     ax.set_ylabel("Residual (log)")
     ax.set_title("Equation Residuals")
-    ax.legend(loc="upper right", fontsize=9)
     ax.grid(True, alpha=0.3, which="both")
-    ax.set_ylim(bottom=1e-10)  # Reasonable floor for log scale
+    ax.set_ylim(bottom=1e-10)
 
-    # Time step history
-    ax = axes[1]
-    ax.plot(iters, data["dt"], "k-", linewidth=1)
-    ax.set_xlabel("Iteration")
-    ax.set_ylabel("dt")
-    ax.set_title("Adaptive Time Step")
-    ax.grid(True, alpha=0.3)
+    # Right y-axis: dt and CFL_max
+    ax2 = ax.twinx()
+    ax2.plot(iters, data["dt"], "k--", linewidth=0.8, alpha=0.6, label="dt")
+    if any(v > 0 for v in data["cfl_max"]):
+        ax2.plot(iters, data["cfl_max"], "k:", linewidth=0.8, alpha=0.6, label=r"CFL$_{\max}$")
+    ax2.set_ylabel(r"dt / CFL$_{\max}$")
 
-    plt.tight_layout()
+    # Combined legend
+    lines1, labels1 = ax.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax.legend(lines1 + lines2, labels1 + labels2, loc="upper right", fontsize=9)
 
     if save_path:
         fig.savefig(save_path, dpi=150, bbox_inches="tight")

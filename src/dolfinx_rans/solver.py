@@ -130,37 +130,55 @@ from dolfinx_rans.utils import (
 
 
 def _plot_convergence_live(history_file: Path, save_path: Path):
-    """Plot convergence history from CSV (called during iteration)."""
+    """Plot convergence history from CSV (called during iteration).
+
+    Single figure: residuals on left y-axis (log), dt/CFL on right y-axis (linear).
+    """
     import csv
     import matplotlib.pyplot as plt
 
     if not history_file.exists():
         return
 
-    iters, residuals, res_u, res_k, res_w = [], [], [], [], []
+    data: dict[str, list[float]] = {"iter": [], "res_u": [], "res_k": [], "res_w": [], "dt": [], "cfl_max": []}
     with open(history_file) as f:
         reader = csv.DictReader(f)
         for row in reader:
-            iters.append(int(row["iter"]))
-            residuals.append(float(row["residual"]))
-            res_u.append(float(row.get("res_u", row["residual"])))
-            res_k.append(float(row.get("res_k", row["residual"])))
-            res_w.append(float(row.get("res_w", row["residual"])))
+            data["iter"].append(int(row["iter"]))
+            data["res_u"].append(float(row.get("res_u", row.get("residual", 1.0))))
+            data["res_k"].append(float(row.get("res_k", 1.0)))
+            data["res_w"].append(float(row.get("res_w", 1.0)))
+            data["dt"].append(float(row["dt"]))
+            cfl = row.get("cfl_max", "")
+            data["cfl_max"].append(float(cfl) if cfl else 0.0)
 
+    iters = data["iter"]
     if len(iters) < 2:
         return
 
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.semilogy(iters, residuals, "k-", linewidth=2, label="max(u,k,omega)")
-    ax.semilogy(iters, res_u, "b--", linewidth=1, alpha=0.7, label="u")
-    ax.semilogy(iters, res_k, "r--", linewidth=1, alpha=0.7, label="k")
-    ax.semilogy(iters, res_w, "g--", linewidth=1, alpha=0.7, label="omega")
-    ax.axhline(1e-6, color="gray", linestyle=":", alpha=0.5, label="tol=1e-6")
+    fig, ax = plt.subplots(figsize=(10, 5))
+
+    # Left y-axis: residuals (log scale)
+    ax.semilogy(iters, data["res_u"], "b-", linewidth=1.2, label="Momentum (u)")
+    ax.semilogy(iters, data["res_k"], "r-", linewidth=1.2, label="TKE (k)")
+    ax.semilogy(iters, data["res_w"], "g-", linewidth=1.2, label=r"Omega ($\omega$)")
     ax.set_xlabel("Iteration")
-    ax.set_ylabel("Residual (relative L2 norm)")
+    ax.set_ylabel("Residual (log)")
     ax.set_title("Convergence History")
-    ax.legend(loc="upper right")
-    ax.grid(True, alpha=0.3)
+    ax.grid(True, alpha=0.3, which="both")
+
+    # Right y-axis: dt and CFL_max
+    ax2 = ax.twinx()
+    ax2.plot(iters, data["dt"], "k--", linewidth=0.8, alpha=0.6, label="dt")
+    if any(v > 0 for v in data["cfl_max"]):
+        ax2.plot(iters, data["cfl_max"], "k:", linewidth=0.8, alpha=0.6, label=r"CFL$_{\max}$")
+    ax2.set_ylabel(r"dt / CFL$_{\max}$")
+
+    # Combined legend
+    lines1, labels1 = ax.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax.legend(lines1 + lines2, labels1 + labels2, loc="upper right", fontsize=9)
+
     fig.savefig(save_path, dpi=100, bbox_inches="tight")
     plt.close(fig)
 
@@ -820,6 +838,8 @@ def solve_rans_kw(
     step = 0
     current_dt = dt
     residual_prev = 1.0
+    ema_ratio = 1.0  # EMA of residual_ratio for smooth dt decisions
+    ema_alpha = 0.1  # smoothing factor: ~10-step effective window
     prev_u_bulk = None
     prev_tau_wall = None
 
@@ -836,14 +856,22 @@ def solve_rans_kw(
             ("k[min,max]", 20),
             ("w[min,max]", 20),
             ("nu_t/nu", 12),
+            ("CFL", 7),
         ])
         hist = HistoryWriterCSV(
             results_dir / "history.csv",
-            ["iter", "dt", "residual", "res_u", "res_k", "res_w", "U_bulk", "tau_wall", "u_max", "k_min", "k_max", "omega_min", "omega_max", "nu_t_nu_max"],
+            ["iter", "dt", "residual", "res_u", "res_k", "res_w", "U_bulk", "tau_wall", "u_max", "k_min", "k_max", "omega_min", "omega_max", "nu_t_nu_max", "cfl_max"],
             enabled=True,
         )
 
     # Pre-compute loop-invariant values
+    import dolfinx.cpp.mesh as _cmesh
+    tdim = domain.topology.dim
+    num_local_cells = domain.topology.index_map(tdim).size_local
+    cell_indices = np.arange(num_local_cells, dtype=np.int32)
+    h_cells = _cmesh.h(domain._cpp_object, tdim, cell_indices)
+    h_min = float(comm.allreduce(np.min(h_cells), op=MPI.MIN))
+
     omega_max_limit = 10.0 * omega_wall_val  # Scale wall-driven cap with current case
     ur_kw = solve.under_relax_k_omega
     alpha_u = 0.7  # velocity under-relaxation factor
@@ -1110,6 +1138,7 @@ def solve_rans_kw(
             kd = diagnostics_scalar(k_)   # contains allreduce
             wd = diagnostics_scalar(omega_)  # contains allreduce
             nu_t_ratio = float(np.max(nu_t_.x.array)) / nu
+            cfl_max = float(ud["umax"]) * current_dt / h_min
 
         if comm.rank == 0 and table is not None and do_log:
             table.row([
@@ -1122,6 +1151,7 @@ def solve_rans_kw(
                 fmt_pair_sci(float(kd["min"]), float(kd["max"]), prec=1),
                 fmt_pair_sci(float(wd["min"]), float(wd["max"]), prec=1),
                 f"{nu_t_ratio:12.1f}",
+                f"{cfl_max:7.2f}",
             ])
             hist.write({
                 "iter": step,
@@ -1138,6 +1168,7 @@ def solve_rans_kw(
                 "omega_min": float(wd["min"]),
                 "omega_max": float(wd["max"]),
                 "nu_t_nu_max": nu_t_ratio,
+                "cfl_max": cfl_max,
             })
 
         # VTX snapshots (ADIOS2 for ParaView)
@@ -1145,34 +1176,35 @@ def solve_rans_kw(
             vtx_vel.write(t)
             vtx_turb.write(t)
 
-        # PNG plots -- decoupled from VTX
+        # Convergence plot at log_interval (cheap: reads CSV, no MPI)
+        if comm.rank == 0 and do_log:
+            _plot_convergence_live(results_dir / "history.csv", results_dir / "convergence.png")
+
+        # Field PNG plots at snapshot_interval (expensive: MPI extraction)
         if do_snapshot:
-            # Flow fields: all ranks must participate (MPI-safe extraction)
             if is_bfs:
                 from dolfinx_rans.plotting import plot_bfs_fields
                 plot_bfs_fields(u_, p_, k_, omega_, nu_t_, domain, geom, nu, save_path=results_dir / "fields.png")
+                if comm.rank == 0:
+                    import shutil
+                    shutil.copy2(results_dir / "fields.png", results_dir / f"fields_{step:05d}.png")
             else:
                 _plot_fields_live(u_, p_, k_, omega_, nu_t_, domain, geom, Re_tau, step, results_dir / "fields.png")
-            if comm.rank == 0:
-                # Residual history: reads CSV, no MPI needed
-                _plot_convergence_live(results_dir / "history.csv", results_dir / "convergence.png")
 
-            # Convergence check
+        # Convergence check
         if residual < solve.steady_tol and (not solve.enable_physical_convergence or physical_converged):
             if comm.rank == 0:
                 print(f"\n*** CONVERGED at iteration {step} (residual = {residual:.2e}) ***")
             break
 
-        # Adaptive dt: grow when residual is monotonically decreasing,
-        # shrink when residual grows more than 5% per step.
-        # The asymmetric thresholds prevent sawtooth dt oscillation:
-        # growth requires a clear decrease, but shrink tolerates small
-        # fluctuations from Picard under-relaxation and transient dynamics.
+        # Adaptive dt via EMA-smoothed residual ratio.
+        # Single-step spikes only move ema_ratio by alpha*spike ≈ 0.1×spike,
+        # so dt changes reflect the trend (≈10-step window), not noise.
         residual_ratio = residual / max(residual_prev, 1e-15)
-        if residual_ratio < solve.dt_growth_threshold:
+        ema_ratio = ema_alpha * residual_ratio + (1.0 - ema_alpha) * ema_ratio
+        if ema_ratio < solve.dt_growth_threshold:
             current_dt = min(current_dt * solve.dt_growth, solve.dt_max)
-        elif residual_ratio > 1.05:
-            # Residual growing → halve dt for recovery
+        elif ema_ratio > 1.05:
             current_dt = max(current_dt * 0.5, solve.dt)
         residual_prev = residual
 
