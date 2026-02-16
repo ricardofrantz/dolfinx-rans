@@ -15,7 +15,7 @@ from petsc4py import PETSc
 from dolfinx import mesh
 from dolfinx.mesh import CellType
 
-from dolfinx_rans.config import BETA_0, ChannelGeom
+from dolfinx_rans.config import BETA_0, BFSGeom, BoundaryInfo, ChannelGeom
 
 
 # =============================================================================
@@ -586,3 +586,193 @@ def compute_wall_distance_eikonal(S, wall_facets, relax: float = 0.01):
     d.x.scatter_forward()
 
     return d
+
+
+# =============================================================================
+# Backward-facing step geometry
+# =============================================================================
+
+
+def create_bfs_mesh(geom: BFSGeom):
+    """
+    Create backward-facing step mesh (L-shaped structured quad mesh).
+
+    Domain layout (flow enters from left)::
+
+        y=H_out ┌──────────────────────────────────────┐ top wall
+                │  Upstream        Downstream          │
+                │  channel         channel             │
+                ├──────────┐                           │
+         y=h    │  (wall)  │ step face                 │
+                │  SOLID   │                           │
+                │          │  recirculation zone       │
+                └──────────┴───────────────────────────┘
+              x=-L_up     x=0                       x=L_down
+                           y=0 (bottom wall downstream)
+
+    Ny_outlet must exceed Ny_inlet so that cells exist below the step.
+    The downstream y-grid is split: Ny_step cells in [0, h] and Ny_inlet
+    cells in [h, H_outlet]. The upstream block shares the upper portion.
+
+    Args:
+        geom: BFS geometry parameters
+
+    Returns:
+        domain: DOLFINx mesh
+    """
+    comm = MPI.COMM_WORLD
+    h = geom.step_height
+    ER = geom.expansion_ratio
+    H_inlet = h / (ER - 1.0)
+    H_outlet = H_inlet + h  # = ER * H_inlet
+
+    L_up = geom.upstream_length * h
+    L_down = geom.downstream_length * h
+
+    Nx_up = geom.Nx_upstream
+    Nx_down = geom.Nx_downstream
+    Ny_in = geom.Ny_inlet
+    Ny_out = geom.Ny_outlet
+    Ny_step = Ny_out - Ny_in
+
+    if Ny_step < 1:
+        raise ValueError(
+            f"Ny_outlet ({Ny_out}) must exceed Ny_inlet ({Ny_in}) "
+            f"to mesh the step region [0, h]"
+        )
+
+    # 1D coordinate arrays (uniform spacing)
+    x_up = np.linspace(-L_up, 0.0, Nx_up + 1)
+    x_down = np.linspace(0.0, L_down, Nx_down + 1)
+    x_all = np.concatenate([x_up[:-1], x_down])  # unique x values
+
+    y_low = np.linspace(0.0, h, Ny_step + 1)
+    y_high = np.linspace(h, H_outlet, Ny_in + 1)
+    y_all = np.concatenate([y_low[:-1], y_high])  # unique y values
+
+    Nx = len(x_all) - 1  # Nx_up + Nx_down
+    Ny = len(y_all) - 1  # Ny_out
+    i_step = Nx_up        # index where x=0
+    j_step = Ny_step      # index where y=h
+
+    # Build node map: (i,j) -> global node index (-1 for solid step region)
+    node_id = -np.ones((Nx + 1, Ny + 1), dtype=np.int64)
+    coords = []
+    n = 0
+    for j in range(Ny + 1):
+        for i in range(Nx + 1):
+            if i < i_step and j < j_step:
+                continue  # inside solid step
+            node_id[i, j] = n
+            coords.append([x_all[i], y_all[j]])
+            n += 1
+    coords = np.array(coords, dtype=np.float64)
+
+    # Quad cells (Basix vertex ordering: BL, BR, TL, TR)
+    cells = []
+    for j in range(Ny):
+        for i in range(Nx):
+            bl = node_id[i, j]
+            br = node_id[i + 1, j]
+            tl = node_id[i, j + 1]
+            tr = node_id[i + 1, j + 1]
+            if min(bl, br, tl, tr) < 0:
+                continue
+            cells.append([bl, br, tl, tr])
+    cells = np.array(cells, dtype=np.int64)
+
+    # Create DOLFINx mesh
+    from basix.ufl import element as basix_element
+
+    e = basix_element("Lagrange", "quadrilateral", 1, shape=(2,))
+    domain = mesh.create_mesh(comm, cells, e, coords)
+
+    if comm.rank == 0:
+        ncells = domain.topology.index_map(domain.topology.dim).size_global
+        print(f"BFS mesh: {ncells} quad cells")
+        print(f"  H_inlet={H_inlet:.4f}, H_outlet={H_outlet:.4f}, h={h}")
+        print(f"  Domain: x in [{-L_up:.1f}, {L_down:.1f}], y in [0, {H_outlet:.4f}]")
+
+    return domain
+
+
+def mark_bfs_boundaries(domain, geom: BFSGeom):
+    """
+    Mark BFS boundaries and return BoundaryInfo.
+
+    Boundary tags:
+        inlet:  x = -L_up (left face, above step)
+        outlet: x = L_down (right face, full height)
+        top:    y = H_outlet (top wall, full length)
+        bottom_upstream: y = h, x <= 0 (step top surface)
+        bottom_downstream: y = 0, x >= 0 (floor after step)
+        step_face: x = 0, y in [0, h] (vertical face of step)
+    """
+    h = geom.step_height
+    ER = geom.expansion_ratio
+    H_inlet = h / (ER - 1.0)
+    H_outlet = H_inlet + h
+    L_up = geom.upstream_length * h
+    L_down = geom.downstream_length * h
+
+    fdim = domain.topology.dim - 1
+    tol = 1e-10
+
+    inlet_f = mesh.locate_entities_boundary(
+        domain, fdim, lambda x: np.isclose(x[0], -L_up, atol=tol)
+    )
+    outlet_f = mesh.locate_entities_boundary(
+        domain, fdim, lambda x: np.isclose(x[0], L_down, atol=tol)
+    )
+    top_f = mesh.locate_entities_boundary(
+        domain, fdim, lambda x: np.isclose(x[1], H_outlet, atol=tol)
+    )
+    bottom_up_f = mesh.locate_entities_boundary(
+        domain, fdim,
+        lambda x: np.isclose(x[1], h, atol=tol) & (x[0] <= tol),
+    )
+    bottom_down_f = mesh.locate_entities_boundary(
+        domain, fdim, lambda x: np.isclose(x[1], 0.0, atol=tol)
+    )
+    step_face_f = mesh.locate_entities_boundary(
+        domain, fdim,
+        lambda x: np.isclose(x[0], 0.0, atol=tol) & (x[1] <= h + tol),
+    )
+
+    wall_f = np.unique(np.concatenate([
+        top_f, bottom_up_f, bottom_down_f, step_face_f,
+    ]))
+
+    return BoundaryInfo(
+        wall_facets=wall_f,
+        inlet_facets=inlet_f,
+        outlet_facets=outlet_f,
+        step_facets=step_face_f,
+        top_facets=top_f,
+        bottom_facets=np.unique(np.concatenate([bottom_up_f, bottom_down_f])),
+    )
+
+
+def initial_velocity_bfs(x, U_inlet, H_outlet):
+    """Parabolic initial velocity profile spanning the full outlet height."""
+    eta = x[1] / H_outlet
+    u_profile = 1.5 * U_inlet * 4.0 * eta * (1.0 - eta)
+    u_profile = np.maximum(u_profile, 0.0)
+    return np.vstack([
+        u_profile.astype(PETSc.ScalarType),
+        np.zeros(x.shape[1], dtype=PETSc.ScalarType),
+    ])
+
+
+def initial_k_bfs(x, U_inlet, intensity=0.05):
+    """Uniform initial TKE for BFS from turbulence intensity."""
+    k_val = max(1.5 * (intensity * U_inlet) ** 2, 1e-8)
+    return np.full(x.shape[1], k_val, dtype=PETSc.ScalarType)
+
+
+def initial_omega_bfs(x, U_inlet, H_inlet):
+    """Uniform initial omega for BFS from mixing-length estimate."""
+    k_val = max(1.5 * (0.05 * U_inlet) ** 2, 1e-8)
+    l_mix = 0.07 * H_inlet
+    omega_val = np.sqrt(k_val) / max(l_mix, 1e-10)
+    return np.full(x.shape[1], omega_val, dtype=PETSc.ScalarType)

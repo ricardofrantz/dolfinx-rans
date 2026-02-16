@@ -2,7 +2,7 @@
 dolfinx-rans: RANS turbulence models for DOLFINx.
 
 A FEniCSx-based implementation of Reynolds-Averaged Navier-Stokes
-turbulence models for channel-flow benchmarking.
+turbulence models for channel flow and backward-facing step.
 
 Requirements:
     - DOLFINx 0.10.0+
@@ -18,20 +18,23 @@ Example:
 __version__ = "0.1.0"
 
 from dolfinx_rans.config import (
+    BFSGeom,
     ChannelGeom,
     NondimParams,
     SolveParams,
     TurbParams,
 )
-from dolfinx_rans.geometry import create_channel_mesh
+from dolfinx_rans.geometry import create_bfs_mesh, create_channel_mesh
 from dolfinx_rans.solver import solve_rans_kw
 
 __all__ = [
     "__version__",
+    "BFSGeom",
     "ChannelGeom",
     "NondimParams",
     "TurbParams",
     "SolveParams",
+    "create_bfs_mesh",
     "create_channel_mesh",
     "solve_rans_kw",
 ]

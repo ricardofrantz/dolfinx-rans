@@ -13,12 +13,17 @@ from pathlib import Path
 from mpi4py import MPI
 
 from dolfinx_rans.config import (
+    BFSGeom,
     ChannelGeom,
     NondimParams,
     SolveParams,
     TurbParams,
 )
-from dolfinx_rans.geometry import create_channel_mesh
+from dolfinx_rans.geometry import (
+    create_bfs_mesh,
+    create_channel_mesh,
+    mark_bfs_boundaries,
+)
 from dolfinx_rans.solver import solve_rans_kw
 from dolfinx_rans.utils import (
     compute_bulk_velocity,
@@ -62,50 +67,37 @@ def _resolve_reference_profile_csv(cfg: dict, cfg_path: Path) -> Path | None:
     return None
 
 
-def main():
-    """Run RANS k-ω solver from command line."""
-    p = argparse.ArgumentParser(
-        description="RANS k-ω channel flow solver for DOLFINx",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-    dolfinx-rans channel_nek_re125k_like.json
-    dolfinx-rans --print-only channel_nek_re125k_like.json
+def _detect_geometry_type(cfg: dict) -> str:
+    """Detect geometry type from config. Returns 'channel' or 'bfs'."""
+    # New-style: explicit "geometry" section with "type" field
+    geom_section = cfg.get("geometry", {})
+    if isinstance(geom_section, dict) and "type" in geom_section:
+        return geom_section["type"].lower()
+    # Legacy: "geom" section implies channel
+    if "geom" in cfg:
+        return "channel"
+    raise ValueError("Config must have either 'geometry' or 'geom' section")
 
-Environment:
-    Requires DOLFINx 0.10.0+.
-    Activate your FEniCSx environment before running.
-        """,
-    )
-    p.add_argument("config", type=str, help="JSON config file")
-    p.add_argument("--print-only", action="store_true", help="Print config and exit")
-    args = p.parse_args()
 
-    cfg_path = Path(args.config)
-    cfg = load_json_config(cfg_path)
-
-    # Parse config sections
-    geom = dc_from_dict(ChannelGeom, cfg["geom"], name="geom")
-    turb = dc_from_dict(TurbParams, cfg["turb"], name="turb")
-    solve = dc_from_dict(SolveParams, cfg["solve"], name="solve")
+def _run_channel(cfg, cfg_path, args, turb, solve_params):
+    """Run channel flow case."""
+    # Parse channel-specific config
+    geom_raw = cfg.get("geometry", cfg.get("geom"))
+    # Strip 'type' key if present (not a ChannelGeom field)
+    geom_dict = {k: v for k, v in geom_raw.items() if k != "type"}
+    geom = dc_from_dict(ChannelGeom, geom_dict, name="geom")
     nondim = dc_from_dict(NondimParams, cfg["nondim"], name="nondim")
-
     Re_tau = nondim.Re_tau
 
     if args.print_only:
         print_dc_json(geom)
-        print_dc_json(turb)
+        print_dc_json(solve_params)
         print_dc_json(nondim)
         return 0
 
-    results_dir = Path(solve.out_dir)
+    results_dir = Path(solve_params.out_dir)
     if MPI.COMM_WORLD.rank == 0:
-        prepare_case_dir(
-            results_dir,
-            config_path=cfg_path,
-            cfg=cfg,
-            snps_subdir="snps",
-        )
+        prepare_case_dir(results_dir, config_path=cfg_path, cfg=cfg, snps_subdir="snps")
     MPI.COMM_WORLD.barrier()
 
     if MPI.COMM_WORLD.rank == 0:
@@ -128,23 +120,15 @@ Environment:
     if MPI.COMM_WORLD.rank == 0 and reference_profile_csv is not None:
         print(f"Reference overlay CSV: {reference_profile_csv}")
 
-    # Plot mesh
     plot_mesh(domain, geom, save_path=results_dir / "mesh.png")
 
     u, p, k, omega, nu_t, V, Q, S, domain, step, t = solve_rans_kw(
-        domain, geom, turb, solve, results_dir, nondim=nondim
+        domain, geom, turb, solve_params, results_dir, nondim=nondim
     )
 
-    # Plot final results
+    # Post-processing
     plot_final_fields(
-        u,
-        p,
-        k,
-        omega,
-        nu_t,
-        domain,
-        geom,
-        Re_tau,
+        u, p, k, omega, nu_t, domain, geom, Re_tau,
         save_path=results_dir / "final_fields.png",
         reference_profile_csv=reference_profile_csv,
     )
@@ -153,15 +137,67 @@ Environment:
         save_path=results_dir / "profiles.csv",
     )
 
-    # Plot convergence history
     history_file = results_dir / "history.csv"
     if history_file.exists():
         plot_convergence(history_file, save_path=results_dir / "convergence.png")
 
-    # Compute U_bulk (MPI collective - all ranks must call)
     U_bulk = compute_bulk_velocity(u, geom.Lx, geom.Ly)
+    _print_summary(domain, u, p, k, omega, nu_t, U_bulk, results_dir)
+    return 0
 
-    # MPI collectives — all ranks must participate
+
+def _run_bfs(cfg, cfg_path, args, turb, solve_params):
+    """Run backward-facing step case."""
+    geom_dict = {k: v for k, v in cfg["geometry"].items() if k != "type"}
+    geom = dc_from_dict(BFSGeom, geom_dict, name="geometry")
+    nondim = dc_from_dict(NondimParams, cfg["nondim"], name="nondim")
+
+    if args.print_only:
+        print_dc_json(geom)
+        print_dc_json(solve_params)
+        print_dc_json(nondim)
+        return 0
+
+    results_dir = Path(solve_params.out_dir)
+    if MPI.COMM_WORLD.rank == 0:
+        prepare_case_dir(results_dir, config_path=cfg_path, cfg=cfg, snps_subdir="snps")
+    MPI.COMM_WORLD.barrier()
+
+    h = geom.step_height
+    ER = geom.expansion_ratio
+    H_inlet = h / (ER - 1.0)
+    H_outlet = H_inlet + h
+
+    if MPI.COMM_WORLD.rank == 0:
+        print("=" * 60)
+        print("RANS k-ω BACKWARD-FACING STEP - dolfinx-rans")
+        print("=" * 60)
+        print(f"Re_τ = {nondim.Re_tau}")
+        print(f"Step height h = {h}, ER = {ER}")
+        print(f"H_inlet = {H_inlet:.4f}, H_outlet = {H_outlet:.4f}")
+        print(f"Mesh: {geom.Nx_upstream}+{geom.Nx_downstream} x {geom.Ny_outlet}")
+        print()
+
+    domain = create_bfs_mesh(geom)
+    boundaries = mark_bfs_boundaries(domain, geom)
+
+    plot_mesh(domain, geom, save_path=results_dir / "mesh.png")
+
+    u, p, k, omega, nu_t, V, Q, S, domain, step, t = solve_rans_kw(
+        domain, geom, turb, solve_params, results_dir,
+        nondim=nondim, boundaries=boundaries,
+    )
+
+    history_file = results_dir / "history.csv"
+    if history_file.exists():
+        plot_convergence(history_file, save_path=results_dir / "convergence.png")
+
+    _print_summary(domain, u, p, k, omega, nu_t, U_bulk=None, results_dir=results_dir)
+    return 0
+
+
+def _print_summary(domain, u, p, k, omega, nu_t, U_bulk, results_dir):
+    """Print final solution diagnostics (all ranks must call)."""
     ud = diagnostics_vector(u)
     pd = diagnostics_scalar(p)
     kd = diagnostics_scalar(k)
@@ -172,7 +208,8 @@ Environment:
         print("\n" + "─" * 50)
         print("FINAL SOLUTION SUMMARY")
         print("─" * 50)
-        print(f"  U_bulk:    {U_bulk:.4f}")
+        if U_bulk is not None:
+            print(f"  U_bulk:    {U_bulk:.4f}")
         print(f"  u:         [{float(ud['c0_min']):.4f}, {float(ud['c0_max']):.4f}]")
         print(f"  v:         [{float(ud['c1_min']):.4f}, {float(ud['c1_max']):.4f}]")
         print(f"  p:         [{float(pd['min']):.4e}, {float(pd['max']):.4e}]")
@@ -183,7 +220,43 @@ Environment:
         print(f"Results saved to {results_dir}/")
         print("=" * 60)
 
-    return 0
+
+def main():
+    """Run RANS k-ω solver from command line."""
+    p = argparse.ArgumentParser(
+        description="RANS k-ω solver for DOLFINx (channel + BFS)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+    dolfinx-rans channel_config.json
+    dolfinx-rans bfs_config.json
+    dolfinx-rans --print-only config.json
+
+Environment:
+    Requires DOLFINx 0.10.0+.
+    Activate your FEniCSx environment before running.
+        """,
+    )
+    p.add_argument("config", type=str, help="JSON config file")
+    p.add_argument("--print-only", action="store_true", help="Print config and exit")
+    args = p.parse_args()
+
+    cfg_path = Path(args.config)
+    cfg = load_json_config(cfg_path)
+
+    # Common config sections
+    turb = dc_from_dict(TurbParams, cfg["turb"], name="turb")
+    solve_params = dc_from_dict(SolveParams, cfg["solve"], name="solve")
+
+    geom_type = _detect_geometry_type(cfg)
+
+    if geom_type == "channel":
+        return _run_channel(cfg, cfg_path, args, turb, solve_params)
+    elif geom_type == "bfs":
+        return _run_bfs(cfg, cfg_path, args, turb, solve_params)
+    else:
+        print(f"ERROR: Unknown geometry type '{geom_type}'. Expected 'channel' or 'bfs'.")
+        return 1
 
 
 if __name__ == "__main__":

@@ -30,19 +30,35 @@ def plot_mesh(domain, geom, save_path: Path | None = None):
         return
 
     polys = [p for rank_polys in all_polys for p in rank_polys]
-    ar = geom.Lx / geom.Ly  # aspect ratio
-    fig_w = 14
-    fig_h = fig_w / ar + 1.2  # match geometry + room for title/labels
 
-    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    # Compute domain extents from actual mesh coordinates
+    all_x = np.concatenate([p[:, 0] for p in polys])
+    all_y = np.concatenate([p[:, 1] for p in polys])
+    x_min, x_max = float(np.min(all_x)), float(np.max(all_x))
+    y_min, y_max = float(np.min(all_y)), float(np.max(all_y))
+    Lx = x_max - x_min
+    Ly_plot = y_max - y_min
+
+    ar = max(Lx / max(Ly_plot, 1e-10), 0.5)
+    fig_w = 14
+    fig_h = fig_w / ar + 1.2
+
+    fig, ax = plt.subplots(figsize=(fig_w, min(fig_h, 20)))
     for pts in polys:
         ax.add_patch(plt.Polygon(pts, fill=False, edgecolor="k", linewidth=0.3))
-    ax.set_xlim(0, geom.Lx)
-    ax.set_ylim(0, geom.Ly)
+    ax.set_xlim(x_min, x_max)
+    ax.set_ylim(y_min, y_max)
     ax.set_aspect("equal")
     ax.set_xlabel("x")
     ax.set_ylabel("y")
-    ax.set_title(f"{geom.Nx}×{geom.Ny} {geom.mesh_type}s  (y_first={geom.y_first:.4f}, growth={geom.growth_rate})")
+
+    # Geometry-specific title
+    from dolfinx_rans.config import BFSGeom
+    if isinstance(geom, BFSGeom):
+        ncells = len(polys)
+        ax.set_title(f"BFS mesh: {ncells} {geom.mesh_type}s  (h={geom.step_height}, ER={geom.expansion_ratio})")
+    else:
+        ax.set_title(f"{geom.Nx}×{geom.Ny} {geom.mesh_type}s  (y_first={geom.y_first:.4f}, growth={geom.growth_rate})")
 
     plt.tight_layout()
 
@@ -150,19 +166,23 @@ def gather_scalar_field(func, comm):
 
 def write_channel_profile_csv(u, k, omega, nu_t, domain, geom, Re_tau, save_path: Path, n_points: int = 256):
     """
-    Export centerline-normalized channel profiles for benchmark comparison.
+    Export centerline-normalized channel profiles for RANS benchmark comparison.
 
     Output columns:
-      y, y_plus, u_plus, k_plus, omega_plus, nu_t_over_nu
+      y, y_over_delta, u, u_over_ubulk, k, omega, nu_t_over_nu
     """
     comm = domain.comm
 
+    # For consistency with channel convention, use wall distance from
+    # the nearest wall (0 in full channel).
+    delta = geom.Ly if geom.use_symmetry else geom.Ly / 2.0
+
     # Avoid sampling exactly on boundaries for robust point evaluation.
     eps = min(1e-6, max(1e-10, 0.1 * geom.y_first))
-    if 2.0 * eps >= geom.Ly:
+    if 2.0 * eps >= delta:
         eps = 1e-10
 
-    y_vals = np.linspace(eps, geom.Ly - eps, n_points)
+    y_vals = np.linspace(eps, delta - eps, n_points)
     x_mid = geom.Lx / 2.0
 
     u_profile, k_profile, omega_profile, nu_t_profile = extract_fields_on_line(
@@ -172,17 +192,37 @@ def write_channel_profile_csv(u, k, omega, nu_t, domain, geom, Re_tau, save_path
     if comm.rank != 0:
         return
 
+    y_over_delta = y_vals / max(delta, 1e-30)
+    # Nek-style normalization is reported in a dedicated column:
+    # - u: solver-native velocity
+    # - u_over_ubulk: u / U_bulk
+    valid = np.isfinite(y_over_delta) & np.isfinite(u_profile)
+    if np.any(valid):
+        u_bulk = float(np.trapezoid(u_profile[valid], y_over_delta[valid]) / max(y_over_delta[valid][-1] - y_over_delta[valid][0], 1e-30))
+    else:
+        u_bulk = 1.0
+    u_profile_out = u_profile
+    u_over_ubulk = u_profile / max(u_bulk, 1e-30)
     nu = 1.0 / Re_tau
-    y_plus = y_vals * Re_tau
+    k_profile_out = k_profile
+    omega_profile_out = omega_profile
     nu_t_over_nu = nu_t_profile / nu
 
     save_path.parent.mkdir(parents=True, exist_ok=True)
-    data = np.column_stack([y_vals, y_plus, u_profile, k_profile, omega_profile, nu_t_over_nu])
+    data = np.column_stack([
+        y_vals,
+        y_over_delta,
+        u_profile_out,
+        u_over_ubulk,
+        k_profile_out,
+        omega_profile_out,
+        nu_t_over_nu,
+    ])
     np.savetxt(
         save_path,
         data,
         delimiter=",",
-        header="y,y_plus,u_plus,k_plus,omega_plus,nu_t_over_nu",
+        header="y,y_over_delta,u,u_over_ubulk,k,omega,nu_t_over_nu",
         comments="",
     )
     print(f"  Saved profile CSV: {save_path}")
@@ -203,30 +243,67 @@ def _load_reference_profile_csv(path: Path | None):
         return None
 
     header = rows[0]
-    if "y_over_delta" not in header:
+    y_over_delta = None
+    if "y_over_delta" in header:
+        y_over_delta = np.array([float(r["y_over_delta"]) for r in rows], dtype=float)
+    elif "y_lower_0_to_1" in header:
+        y_over_delta = np.array([float(r["y_lower_0_to_1"]) for r in rows], dtype=float)
+    else:
+        # Keep legacy wall-unit support only when Re_tau is directly available.
+        if "y_plus" in header and "Re_tau" in header:
+            re_tau = float(rows[0]["Re_tau"])
+            if re_tau > 0:
+                y_over_delta = np.array([float(r["y_plus"]) for r in rows], dtype=float) / re_tau
+    if y_over_delta is None:
+        return None
+    if not np.all(np.isfinite(y_over_delta)):
         return None
 
-    y_over_delta = np.array([float(r["y_over_delta"]) for r in rows], dtype=float)
     order = np.argsort(y_over_delta)
     out = {
         "label": f"Reference ({path.stem})",
         "y_over_delta": y_over_delta[order],
     }
 
-    for key in ("u", "u_over_ubulk", "v", "pressure", "temp", "scalar_1", "scalar_2"):
+    for key in ("u", "v", "pressure", "temp", "scalar_1", "scalar_2", "k", "omega", "u_over_ubulk"):
         if key in header:
             out[key] = np.array([float(r[key]) for r in rows], dtype=float)[order]
 
-    # Backward compatibility for older reference profiles.
-    if "u_over_ubulk" not in out and "u_plus" in header:
-        out["u"] = np.array([float(r["u_plus"]) for r in rows], dtype=float)[order]
+    # Backward compatibility:
+    #   - u_plus / k_plus in old outputs are wall-units
+    #   - u and k here are solver-native for RANS (already physical / non-wall scaled)
+    if "u_over_ubulk" not in out:
+        u_raw = None
+        if "u" in header:
+            u_raw = np.array([float(r["u"]) for r in rows], dtype=float)[order]
+        elif "u_plus" in header:
+            u_raw = np.array([float(r["u_plus"]) for r in rows], dtype=float)[order]
+        if u_raw is not None:
+            y_ref = np.asarray(out["y_over_delta"], dtype=float)
+            u_bulk = float(np.trapezoid(u_raw, y_ref) / max(y_ref[-1] - y_ref[0], 1e-30))
+            out["u_over_ubulk"] = u_raw / max(u_bulk, 1e-30)
 
-    # If only raw u is provided, build U/U_bulk from the same profile.
-    if "u_over_ubulk" not in out and "u" in out:
-        y_ref = np.asarray(out["y_over_delta"], dtype=float)
-        u_ref = np.asarray(out["u"], dtype=float)
-        bulk = float(np.trapezoid(u_ref, y_ref) / max(y_ref[-1] - y_ref[0], 1e-30))
-        out["u_over_ubulk"] = u_ref / max(bulk, 1e-30)
+    if "scalar_1" not in out:
+        if "k_over_ubulk" in header:
+            out["scalar_1"] = np.array([float(r["k_over_ubulk"]) for r in rows], dtype=float)[order]
+        elif "k" in header:
+            y_ref = np.asarray(out["y_over_delta"], dtype=float)
+            k_ref = np.array([float(r["k"]) for r in rows], dtype=float)[order]
+            k_bulk = float(np.trapezoid(k_ref, y_ref) / max(y_ref[-1] - y_ref[0], 1e-30))
+            out["scalar_1"] = k_ref / max(k_bulk, 1e-30)
+        elif "k_plus" in header:
+            y_ref = np.asarray(out["y_over_delta"], dtype=float)
+            k_plus = np.array([float(r["k_plus"]) for r in rows], dtype=float)[order]
+            k_bulk = float(np.trapezoid(k_plus, y_ref) / max(y_ref[-1] - y_ref[0], 1e-30))
+            out["scalar_1"] = k_plus / max(k_bulk, 1e-30)
+
+    if "scalar_2" not in out:
+        if "omega_over_ubulk" in header:
+            out["scalar_2"] = np.array([float(r["omega_over_ubulk"]) for r in rows], dtype=float)[order]
+        elif "omega_plus" in header:
+            out["scalar_2"] = np.array([float(r["omega_plus"]) for r in rows], dtype=float)[order]
+        elif "omega" in header:
+            out["scalar_2"] = np.array([float(r["omega"]) for r in rows], dtype=float)[order]
 
     return out
 

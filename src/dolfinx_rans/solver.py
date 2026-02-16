@@ -93,6 +93,8 @@ from dolfinx_rans.config import (
     SST_SIGMA_K2,
     SST_SIGMA_W1,
     SST_SIGMA_W2,
+    BFSGeom,
+    BoundaryInfo,
     ChannelGeom,
     NondimParams,
     SolveParams,
@@ -101,9 +103,13 @@ from dolfinx_rans.config import (
 from dolfinx_rans.geometry import (
     compute_wall_distance_eikonal,
     infer_first_offwall_spacing,
+    initial_k_bfs,
     initial_k_channel,
+    initial_omega_bfs,
     initial_omega_channel,
+    initial_velocity_bfs,
     initial_velocity_channel,
+    mark_bfs_boundaries,
     mark_channel_boundaries,
 )
 from dolfinx_rans.utils import (
@@ -275,6 +281,41 @@ def _plot_fields_live(u, p, k, omega, nu_t, domain, geom, Re_tau, step, save_pat
     plt.close(fig)
 
 
+def _infer_y_first_general(domain, wall_facets, fdim):
+    """Infer first off-wall spacing from wall facet geometry (any domain shape)."""
+    from dolfinx.mesh import compute_midpoints
+
+    comm = domain.comm
+    domain.topology.create_connectivity(fdim, domain.topology.dim)
+
+    # Get midpoints of wall facets
+    wall_mids = compute_midpoints(domain, fdim, wall_facets)
+
+    # Get all mesh node coordinates
+    x = domain.geometry.x
+
+    # For each node, compute minimum distance to any wall facet midpoint.
+    # This is approximate but sufficient for the omega_wall BC.
+    if wall_mids.shape[0] == 0 or x.shape[0] == 0:
+        local_min = np.inf
+    else:
+        # Vectorized: distance from each mesh node to nearest wall midpoint
+        dists = np.min(np.linalg.norm(
+            x[:, None, :2] - wall_mids[None, :, :2], axis=2
+        ), axis=1)
+        positive = dists[dists > 1e-12]
+        local_min = float(np.min(positive)) if positive.size > 0 else np.inf
+
+    y_first = float(comm.allreduce(local_min, op=MPI.MIN))
+    if not np.isfinite(y_first):
+        y_first = 1e-3  # fallback
+        if comm.rank == 0:
+            print(f"WARNING: Could not infer y_first from mesh, using fallback {y_first}")
+    elif comm.rank == 0:
+        print(f"Inferred y_first = {y_first:.6e} from wall facets")
+    return y_first
+
+
 # =============================================================================
 # Main solver
 # =============================================================================
@@ -282,22 +323,26 @@ def _plot_fields_live(u, p, k, omega, nu_t, domain, geom, Re_tau, step, save_pat
 
 def solve_rans_kw(
     domain,
-    geom: ChannelGeom,
+    geom,
     turb: TurbParams,
     solve: SolveParams,
     results_dir: Path,
-    nondim: NondimParams,
+    nondim: NondimParams = None,
+    boundaries: BoundaryInfo = None,
 ):
     """
-    Solve RANS k-omega channel flow with pseudo-transient continuation.
+    Solve RANS k-omega flow with pseudo-transient continuation.
+
+    Supports both channel flow (ChannelGeom) and backward-facing step (BFSGeom).
 
     Args:
         domain: DOLFINx mesh
-        geom: Channel geometry
+        geom: Geometry (ChannelGeom or BFSGeom)
         turb: Turbulence model parameters
         solve: Solver parameters
         results_dir: Output directory
-        nondim: Nondimensional scaling parameters
+        nondim: Nondimensional scaling (required for channel, optional for BFS)
+        boundaries: Pre-computed boundary info (required for BFS)
 
     Returns:
         Tuple of (u, p, k, omega, nu_t, V, Q, S, domain, step, t)
@@ -306,18 +351,34 @@ def solve_rans_kw(
     fdim = domain.topology.dim - 1
     comm = domain.comm
 
-    Ly = geom.Ly
-    H = Ly if geom.use_symmetry else Ly / 2.0  # H = delta (half-channel height)
+    is_bfs = isinstance(geom, BFSGeom)
 
-    # Nondimensional mode
-    Re_tau = nondim.Re_tau
-    nu = 1.0 / Re_tau
-    rho = 1.0
-    use_body_force = nondim.use_body_force
-    u_bulk_init = 15.0  # Conservative initial
+    if is_bfs:
+        h = geom.step_height
+        ER = geom.expansion_ratio
+        H_inlet = h / (ER - 1.0)
+        H_outlet = H_inlet + h
+        Ly = H_outlet
+        H = H_inlet  # reference height for turbulence ICs
+        Re_tau = nondim.Re_tau if nondim is not None else 100.0
+        nu = 1.0 / Re_tau
+        rho = 1.0
+        use_body_force = False
+        u_bulk_init = 1.0
+    else:
+        Ly = geom.Ly
+        H = Ly if geom.use_symmetry else Ly / 2.0
+        Re_tau = nondim.Re_tau
+        nu = 1.0 / Re_tau
+        rho = 1.0
+        use_body_force = nondim.use_body_force
+        u_bulk_init = 15.0  # Conservative initial
 
     if comm.rank == 0:
-        print(f"NONDIMENSIONAL MODE: Re_tau = {Re_tau}", flush=True)
+        if is_bfs:
+            print(f"BFS MODE: Re_tau = {Re_tau}", flush=True)
+        else:
+            print(f"NONDIMENSIONAL MODE: Re_tau = {Re_tau}", flush=True)
         print(f"  nu* = 1/Re_tau = {nu:.6f}", flush=True)
         print(f"  Body force: f_x = {1.0 if use_body_force else 0.0}", flush=True)
 
@@ -332,32 +393,39 @@ def solve_rans_kw(
     Q0 = functionspace(domain, ("Lagrange", 1))
     S0 = functionspace(domain, ("Lagrange", 1))
 
-    # Boundary facets
-    bottom_facets, top_facets, left_facets, right_facets = mark_channel_boundaries(domain, geom.Lx, Ly)
+    # Boundary facets — geometry-dispatched
+    if is_bfs:
+        if boundaries is None:
+            boundaries = mark_bfs_boundaries(domain, geom)
+        wall_facets_tb = boundaries.wall_facets
+        outlet_facets = boundaries.outlet_facets
+        inlet_facets = boundaries.inlet_facets
 
-    y_first_cfg = geom.y_first
-    y_first = infer_first_offwall_spacing(domain, Ly, geom.use_symmetry)
-    if y_first_cfg > 0:
-        rel_err = abs(y_first - y_first_cfg) / y_first_cfg
-        if rel_err > geom.y_first_tol_rel:
-            raise ValueError(
-                "Mesh/BC inconsistency at solve stage: "
-                f"requested y_first={y_first_cfg:.6e}, measured from mesh={y_first:.6e}, "
-                f"relative error={100.0 * rel_err:.1f}% exceeds tolerance "
-                f"{100.0 * geom.y_first_tol_rel:.1f}%."
-            )
-    omega_wall_val = 6.0 * nu / (BETA_0 * y_first**2)
-
-    u_noslip = np.array([0.0, 0.0], dtype=PETSc.ScalarType)
-
-    if geom.use_symmetry:
-        # Half-channel: wall at bottom, symmetry at top
-        # Bottom: no-slip (u=0, v=0), k=0, omega=omega_wall
-        # Top: symmetry (v=0, du/dy=0 natural, dk/dy=0 natural, domega/dy=0 natural)
-        wall_facets_tb = bottom_facets
+        # Infer y_first from the mesh (minimum wall distance of any node)
+        y_first = _infer_y_first_general(domain, wall_facets_tb, fdim)
     else:
-        # Full channel: walls at both top and bottom
-        wall_facets_tb = np.concatenate([bottom_facets, top_facets])
+        bottom_facets, top_facets, left_facets, right_facets = mark_channel_boundaries(domain, geom.Lx, Ly)
+        outlet_facets = right_facets
+
+        y_first_cfg = geom.y_first
+        y_first = infer_first_offwall_spacing(domain, Ly, geom.use_symmetry)
+        if y_first_cfg > 0:
+            rel_err = abs(y_first - y_first_cfg) / y_first_cfg
+            if rel_err > geom.y_first_tol_rel:
+                raise ValueError(
+                    "Mesh/BC inconsistency at solve stage: "
+                    f"requested y_first={y_first_cfg:.6e}, measured from mesh={y_first:.6e}, "
+                    f"relative error={100.0 * rel_err:.1f}% exceeds tolerance "
+                    f"{100.0 * geom.y_first_tol_rel:.1f}%."
+                )
+
+        if geom.use_symmetry:
+            wall_facets_tb = bottom_facets
+        else:
+            wall_facets_tb = np.concatenate([bottom_facets, top_facets])
+
+    omega_wall_val = 6.0 * nu / (BETA_0 * y_first**2)
+    u_noslip = np.array([0.0, 0.0], dtype=PETSc.ScalarType)
 
     V, Q, S = V0, Q0, S0
 
@@ -461,13 +529,17 @@ def solve_rans_kw(
     else:
         f = Constant(domain, PETSc.ScalarType((0.0, 0.0)))
 
-    # Initial conditions
-    u_n.interpolate(lambda x: initial_velocity_channel(x, u_bulk_init, Ly, geom.use_symmetry))
+    # Initial conditions — geometry-dispatched
+    if is_bfs:
+        u_n.interpolate(lambda x: initial_velocity_bfs(x, u_bulk_init, Ly))
+        k_n.interpolate(lambda x: initial_k_bfs(x, u_bulk_init))
+        omega_n.interpolate(lambda x: initial_omega_bfs(x, u_bulk_init, H))
+    else:
+        u_n.interpolate(lambda x: initial_velocity_channel(x, u_bulk_init, Ly, geom.use_symmetry))
+        k_n.interpolate(lambda x: initial_k_channel(x, u_bulk_init))
+        omega_n.interpolate(lambda x: initial_omega_channel(x, u_bulk_init, H, nu))
     u_n1.x.array[:] = u_n.x.array
     u_.x.array[:] = u_n.x.array
-
-    k_n.interpolate(lambda x: initial_k_channel(x, u_bulk_init))
-    omega_n.interpolate(lambda x: initial_omega_channel(x, u_bulk_init, H, nu))
 
     k_.x.array[:] = k_n.x.array
     omega_.x.array[:] = omega_n.x.array
@@ -483,31 +555,49 @@ def solve_rans_kw(
 
     bc_walls_u = dirichletbc(u_noslip, wall_dofs_V_tb, V)
 
-    # Build velocity BCs list
-    if geom.use_symmetry:
-        # Add symmetry BC at top: v=0 (y-component only).
-        # DOLFINx 0.10.0 requires Function on collapsed subspace for subspace BC
+    # Build velocity BCs list — geometry-dispatched
+    bcu = [bc_walls_u]
+
+    if is_bfs:
+        # BFS: add inlet velocity Dirichlet BC (parabolic profile)
+        u_inlet_func = Function(V)
+        u_inlet_func.interpolate(lambda x: initial_velocity_bfs(x, u_bulk_init, Ly))
+        inlet_dofs_V = locate_dofs_topological(V, fdim, inlet_facets)
+        bc_inlet_u = dirichletbc(u_inlet_func, inlet_dofs_V)
+        bcu.append(bc_inlet_u)
+
+        # Inlet k and omega Dirichlet BCs
+        inlet_dofs_S = locate_dofs_topological(S, fdim, inlet_facets)
+        k_inlet_val = max(1.5 * (0.05 * u_bulk_init) ** 2, 1e-8)
+        omega_inlet_val = np.sqrt(k_inlet_val) / max(0.07 * H, 1e-10)
+        bc_k_inlet = dirichletbc(PETSc.ScalarType(k_inlet_val), inlet_dofs_S, S)
+        bc_w_inlet = dirichletbc(PETSc.ScalarType(omega_inlet_val), inlet_dofs_S, S)
+    elif hasattr(geom, "use_symmetry") and geom.use_symmetry:
+        # Channel symmetry BC at top: v=0 (y-component only)
         V_y_sub = V.sub(1)
         V_y_collapsed, _ = V_y_sub.collapse()
         zero_vy_solve = Function(V_y_collapsed)
         zero_vy_solve.x.array[:] = 0.0
         top_dofs_Vy_solve = locate_dofs_topological((V_y_sub, V_y_collapsed), fdim, top_facets)
         bc_sym_v = dirichletbc(zero_vy_solve, top_dofs_Vy_solve, V_y_sub)
-        bcu = [bc_walls_u, bc_sym_v]
-    else:
-        bcu = [bc_walls_u]
+        bcu.append(bc_sym_v)
 
-    outlet_dofs_Q = locate_dofs_topological(Q, fdim, right_facets)
+    outlet_dofs_Q = locate_dofs_topological(Q, fdim, outlet_facets)
     bc_pressure = dirichletbc(PETSc.ScalarType(0.0), outlet_dofs_Q, Q)
     bcp = [bc_pressure]
 
     bc_k_wall = dirichletbc(PETSc.ScalarType(0.0), wall_dofs_S_tb, S)
     bck = [bc_k_wall]
+    if is_bfs:
+        bck.append(bc_k_inlet)
 
     bc_w_wall = dirichletbc(PETSc.ScalarType(omega_wall_val), wall_dofs_S_tb, S)
     bcw = [bc_w_wall]
+    if is_bfs:
+        bcw.append(bc_w_inlet)
 
     if comm.rank == 0:
+        y_first_cfg = geom.y_first if hasattr(geom, "y_first") else y_first
         print(
             f"Wall omega BC: omega_wall = {omega_wall_val:.2e} "
             f"(y_first mesh = {y_first:.6f}, requested = {y_first_cfg:.6f})",
@@ -967,7 +1057,10 @@ def solve_rans_kw(
 
         # MPI collectives -- all ranks must participate (even if only rank 0 prints)
         if collect_physical:
-            U_bulk = compute_bulk_velocity(u_, geom.Lx, Ly)
+            if not is_bfs:
+                U_bulk = compute_bulk_velocity(u_, geom.Lx, Ly)
+            else:
+                U_bulk = 0.0  # Not meaningful for BFS (non-periodic)
             tau_wall = eval_wall_shear_stress(wss_ctx)
         else:
             U_bulk = 0.0
@@ -1030,7 +1123,8 @@ def solve_rans_kw(
         # PNG plots -- decoupled from VTX
         if do_snapshot:
             # Flow fields: all ranks must participate (MPI-safe extraction)
-            _plot_fields_live(u_, p_, k_, omega_, nu_t_, domain, geom, Re_tau, step, results_dir / "fields.png")
+            if not is_bfs:  # Live field plots are channel-specific for now
+                _plot_fields_live(u_, p_, k_, omega_, nu_t_, domain, geom, Re_tau, step, results_dir / "fields.png")
             if comm.rank == 0:
                 # Residual history: reads CSV, no MPI needed
                 _plot_convergence_live(results_dir / "history.csv", results_dir / "convergence.png")
