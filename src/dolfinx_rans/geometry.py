@@ -243,7 +243,8 @@ def _create_stretched_mesh(Lx: float, Ly: float, Nx: int, Ny: int, y_coords: np.
         idx = np.searchsorted(y_uniform, y_old, side="right") - 1
         idx = max(0, min(idx, Ny - 1))
         # Linear interpolation within the cell
-        t = (y_old - y_uniform[idx]) / (y_uniform[idx + 1] - y_uniform[idx]) if y_uniform[idx + 1] != y_uniform[idx] else 0
+        dy_uniform = y_uniform[idx + 1] - y_uniform[idx]
+        t = (y_old - y_uniform[idx]) / dy_uniform if abs(dy_uniform) > 1e-14 else 0.0
         x[i, 1] = y_coords[idx] + t * (y_coords[idx + 1] - y_coords[idx])
 
     return domain
@@ -483,6 +484,8 @@ def compute_wall_distance_eikonal(S, wall_facets, relax: float = 0.01):
     d.x.scatter_forward()
 
     # Ensure non-negative (Laplace solution should be positive, but clip for safety)
+    if not np.all(np.isfinite(d.x.array)):
+        raise RuntimeError("Eikonal Laplace warm-up produced non-finite values")
     d.x.array[:] = np.maximum(d.x.array, 0.0)
     d.x.scatter_forward()
 

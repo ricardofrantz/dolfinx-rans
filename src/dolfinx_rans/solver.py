@@ -353,6 +353,9 @@ def solve_rans_kw(
 
     is_bfs = isinstance(geom, BFSGeom)
 
+    if not is_bfs and nondim is None:
+        raise ValueError("nondim is required for channel geometry")
+
     if is_bfs:
         h = geom.step_height
         ER = geom.expansion_ratio
@@ -401,8 +404,11 @@ def solve_rans_kw(
         outlet_facets = boundaries.outlet_facets
         inlet_facets = boundaries.inlet_facets
 
-        # Infer y_first from the mesh (minimum wall distance of any node)
-        y_first = _infer_y_first_general(domain, wall_facets_tb, fdim)
+        # Use user-specified y_first; fall back to mesh inference
+        if geom.y_first > 0:
+            y_first = geom.y_first
+        else:
+            y_first = _infer_y_first_general(domain, wall_facets_tb, fdim)
     else:
         bottom_facets, top_facets, left_facets, right_facets = mark_channel_boundaries(domain, geom.Lx, Ly)
         outlet_facets = right_facets
