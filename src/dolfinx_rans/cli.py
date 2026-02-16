@@ -27,6 +27,7 @@ from dolfinx_rans.geometry import (
 from dolfinx_rans.solver import solve_rans_kw
 from dolfinx_rans.utils import (
     compute_bulk_velocity,
+    compute_reattachment_length,
     dc_from_dict,
     diagnostics_scalar,
     diagnostics_vector,
@@ -39,6 +40,10 @@ from dolfinx_rans.plotting import (
     plot_final_fields,
     plot_convergence,
     write_channel_profile_csv,
+    plot_bfs_fields,
+    plot_bfs_cf,
+    plot_bfs_profiles,
+    write_bfs_profile_csv,
 )
 
 
@@ -187,6 +192,29 @@ def _run_bfs(cfg, cfg_path, args, turb, solve_params):
         domain, geom, turb, solve_params, results_dir,
         nondim=nondim, boundaries=boundaries,
     )
+
+    # Post-processing
+    nu = 1.0 / nondim.Re_tau
+
+    # 2D contour fields
+    plot_bfs_fields(u, p, k, omega, nu_t, domain, geom, nu,
+                    save_path=results_dir / "bfs_fields.png")
+
+    # Reattachment length (all ranks must participate)
+    x_r = compute_reattachment_length(u, domain, nu, x_step=0.0, y_wall=0.0)
+    if MPI.COMM_WORLD.rank == 0 and x_r is not None:
+        print(f"  Reattachment length: x_r = {x_r:.3f}, x_r/h = {x_r/h:.2f}")
+
+    # Skin friction along bottom wall
+    plot_bfs_cf(u, domain, geom, nu, x_r=x_r, save_path=results_dir / "bfs_cf.png")
+
+    # Vertical profiles at downstream stations
+    plot_bfs_profiles(u, k, nu_t, domain, geom, nu,
+                      save_path=results_dir / "bfs_profiles.png")
+
+    # CSV export
+    write_bfs_profile_csv(u, k, omega, nu_t, domain, geom, nu,
+                          save_path=results_dir / "bfs_profiles.csv")
 
     history_file = results_dir / "history.csv"
     if history_file.exists():

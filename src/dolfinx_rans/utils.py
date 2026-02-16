@@ -246,7 +246,7 @@ class HistoryWriterCSV:
                 self._writer = None
 
 
-def prepare_wall_shear_stress(u, domain, nu: float, wall_tag: int = 1):
+def prepare_wall_shear_stress(u, domain, nu: float, wall_tag: int = 1, wall_facets=None):
     """
     Precompute forms for wall shear stress evaluation.
 
@@ -258,6 +258,8 @@ def prepare_wall_shear_stress(u, domain, nu: float, wall_tag: int = 1):
         domain: Mesh
         nu: Kinematic viscosity (1/Re_tau for nondimensional)
         wall_tag: Boundary tag for wall (default 1)
+        wall_facets: Optional pre-identified wall facet indices. If None,
+            locates facets at y=0 (channel default).
 
     Returns:
         dict with precomputed forms and wall_length
@@ -272,10 +274,10 @@ def prepare_wall_shear_stress(u, domain, nu: float, wall_tag: int = 1):
     fdim = domain.topology.dim - 1
     domain.topology.create_connectivity(fdim, domain.topology.dim)
 
-    def wall_boundary(x):
-        return np.isclose(x[1], 0.0)
-
-    wall_facets = locate_entities_boundary(domain, fdim, wall_boundary)
+    if wall_facets is None:
+        def wall_boundary(x):
+            return np.isclose(x[1], 0.0)
+        wall_facets = locate_entities_boundary(domain, fdim, wall_boundary)
 
     num_facets = domain.topology.index_map(fdim).size_local
     facet_values = np.zeros(num_facets, dtype=np.int32)
@@ -386,6 +388,117 @@ def diagnostics_scalar(f) -> dict[str, float | bool]:
     vmin = float(comm.allreduce(local_min, op=MPI.MIN))
     vmax = float(comm.allreduce(local_max, op=MPI.MAX))
     return {"min": vmin, "max": vmax, "finite": finite}
+
+
+def compute_cf_along_wall(u, domain, nu: float, x_coords, y_wall: float = 0.0):
+    """
+    Compute skin friction coefficient Cf(x) along a horizontal wall.
+
+    Evaluates Cf = 2 * nu * (du/dy)|_wall at specified x-coordinates.
+    Positive Cf indicates attached flow (wall-ward), negative indicates
+    reversed flow (recirculation).
+
+    Args:
+        u: Velocity vector function
+        domain: DOLFINx mesh
+        nu: Kinematic viscosity
+        x_coords: 1D array of x-positions to sample
+        y_wall: y-coordinate of the wall (default 0.0)
+
+    Returns:
+        cf: 1D array of Cf values at each x_coords (MPI-reduced across all ranks)
+    """
+    import numpy as np
+    from mpi4py import MPI
+    from dolfinx import geometry as geom_mod
+    import ufl
+
+    comm = domain.comm
+
+    # Sample points slightly off the wall to avoid degenerate facet evaluation
+    eps = 1e-6
+    y_sample = y_wall + eps
+    points = np.zeros((len(x_coords), 3))
+    points[:, 0] = x_coords
+    points[:, 1] = y_sample
+
+    bb_tree = geom_mod.bb_tree(domain, domain.topology.dim)
+    cell_candidates = geom_mod.compute_collisions_points(bb_tree, points)
+    cells = geom_mod.compute_colliding_cells(domain, cell_candidates, points)
+
+    # Build DG-0 expression for du_x/dy
+    from dolfinx.fem import Expression, Function, functionspace
+
+    S_dg = functionspace(domain, ("DG", 0))
+    du_dy_expr = Expression(ufl.grad(u)[0, 1], S_dg.element.interpolation_points)
+    du_dy_func = Function(S_dg)
+    du_dy_func.interpolate(du_dy_expr)
+
+    cf_local = np.zeros(len(x_coords))
+    found = np.zeros(len(x_coords))
+    for i, pt in enumerate(points):
+        if len(cells.links(i)) > 0:
+            cell = cells.links(i)[0]
+            # DOLFINx Function.eval — FE interpolation at point (not Python eval)
+            val = du_dy_func.eval(pt, cell)  # noqa: S307
+            cf_local[i] = 2.0 * nu * val[0]
+            found[i] = 1.0
+
+    # MPI reduction
+    global_found = comm.allreduce(found, op=MPI.SUM)
+    cf_global = comm.allreduce(cf_local, op=MPI.SUM)
+    mask = global_found > 0
+    cf_global[mask] /= global_found[mask]
+
+    return cf_global
+
+
+def compute_reattachment_length(u, domain, nu: float, x_step: float = 0.0,
+                                 x_max: float = None, y_wall: float = 0.0,
+                                 n_points: int = 200):
+    """
+    Find reattachment point downstream of a backward-facing step.
+
+    The reattachment point is where Cf crosses from negative (recirculation)
+    to positive (attached flow). Returns x_r (the reattachment x-coordinate)
+    or None if no sign change is found.
+
+    Args:
+        u: Velocity vector function
+        domain: DOLFINx mesh
+        nu: Kinematic viscosity
+        x_step: x-coordinate of the step (default 0.0)
+        x_max: Maximum x to search (default: domain extent)
+        y_wall: y-coordinate of the bottom wall
+        n_points: Number of sample points
+
+    Returns:
+        x_r: Reattachment x-coordinate, or None if not found
+    """
+    import numpy as np
+    from mpi4py import MPI
+
+    comm = domain.comm
+
+    if x_max is None:
+        all_x = domain.geometry.x[:, 0]
+        local_max = float(np.max(all_x)) if all_x.size else -np.inf
+        x_max = float(comm.allreduce(local_max, op=MPI.MAX))
+
+    # Sample a bit downstream of step to avoid the step corner singularity
+    x_start = x_step + 0.1 * (x_max - x_step) / n_points
+    x_coords = np.linspace(x_start, x_max * 0.99, n_points)
+
+    cf = compute_cf_along_wall(u, domain, nu, x_coords, y_wall=y_wall)
+
+    # Find first sign change from negative to positive (on rank 0)
+    if comm.rank == 0:
+        for i in range(len(cf) - 1):
+            if cf[i] < 0 and cf[i + 1] >= 0:
+                # Linear interpolation for precise crossing
+                x_r = x_coords[i] - cf[i] * (x_coords[i + 1] - x_coords[i]) / (cf[i + 1] - cf[i])
+                return float(x_r)
+    return None
 
 
 def diagnostics_vector(u) -> dict[str, float | bool]:

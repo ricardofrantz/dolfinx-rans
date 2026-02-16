@@ -593,7 +593,7 @@ def plot_final_fields(
     plt.close(fig)
 
 
-def _tricontour(ax, x, y, vals, label, geom, n_levels=32):
+def _tricontour(ax, x, y, vals, label, geom=None, n_levels=32):
     """Helper for tricontourf with safe level handling and correct aspect ratio."""
     vmin, vmax = np.min(vals), np.max(vals)
     if vmax - vmin < 1e-15:
@@ -604,8 +604,13 @@ def _tricontour(ax, x, y, vals, label, geom, n_levels=32):
     ax.set_xlabel("x")
     ax.set_ylabel("y")
     ax.set_title(label)
-    ax.set_xlim(0, geom.Lx)
-    ax.set_ylim(0, geom.Ly)
+    # Geometry-agnostic limits from data extents
+    if geom is not None and hasattr(geom, "Lx"):
+        ax.set_xlim(0, geom.Lx)
+        ax.set_ylim(0, geom.Ly)
+    else:
+        ax.set_xlim(np.min(x), np.max(x))
+        ax.set_ylim(np.min(y), np.max(y))
     plt.colorbar(tcf, ax=ax, shrink=0.8)
 
 
@@ -668,3 +673,243 @@ def plot_convergence(history_file: Path, save_path: Path | None = None):
         fig.savefig(save_path, dpi=150, bbox_inches="tight")
         print(f"  Saved convergence plot: {save_path}")
     plt.close(fig)
+
+
+# =============================================================================
+# BFS-specific plotting
+# =============================================================================
+
+
+def plot_bfs_fields(u, p, k, omega, nu_t, domain, geom, nu, save_path=None):
+    """
+    Plot 2D contour fields for backward-facing step.
+
+    Shows u, v, k, nu_t/nu as colormaps over the L-shaped domain.
+    All ranks participate in gathering data; only rank 0 plots.
+
+    Args:
+        u, p, k, omega, nu_t: Solution fields
+        domain: DOLFINx mesh
+        geom: BFSGeom
+        nu: Kinematic viscosity
+        save_path: Path to save PNG (optional)
+    """
+    comm = domain.comm
+
+    # Phase 1: gather 2D fields (ALL ranks)
+    ux_x, ux_y, ux_vals = gather_scalar_field(u.sub(0).collapse(), comm)
+    uy_x, uy_y, uy_vals = gather_scalar_field(u.sub(1).collapse(), comm)
+    k_x, k_y, k_vals = gather_scalar_field(k, comm)
+    nut_x, nut_y, nut_vals = gather_scalar_field(nu_t, comm)
+
+    # Phase 2: plot (rank 0 only)
+    if comm.rank != 0:
+        return
+
+    h = geom.step_height
+    fig, axes = plt.subplots(2, 2, figsize=(16, 6))
+
+    _tricontour(axes[0, 0], ux_x, ux_y, ux_vals, f"u (streamwise)")
+    _tricontour(axes[0, 1], uy_x, uy_y, uy_vals, f"v (wall-normal)")
+    _tricontour(axes[1, 0], k_x, k_y, k_vals, "k (TKE)")
+    nut_ratio = nut_vals / nu
+    _tricontour(axes[1, 1], nut_x, nut_y, nut_ratio, f"nu_t/nu (max={np.max(nut_ratio):.0f})")
+
+    fig.suptitle(f"BFS fields: h={h}, ER={geom.expansion_ratio}", fontsize=13)
+    plt.tight_layout()
+
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        print(f"  Saved BFS fields plot: {save_path}")
+    plt.close(fig)
+
+
+def plot_bfs_cf(u, domain, geom, nu, x_r=None, save_path=None):
+    """
+    Plot skin friction coefficient Cf(x/h) along the bottom wall.
+
+    Negative Cf indicates reversed flow (recirculation zone).
+    Marks reattachment point if provided.
+
+    All ranks participate in Cf computation; only rank 0 plots.
+
+    Args:
+        u: Velocity vector function
+        domain: DOLFINx mesh
+        geom: BFSGeom
+        nu: Kinematic viscosity
+        x_r: Reattachment x-coordinate (optional, for annotation)
+        save_path: Path to save PNG (optional)
+    """
+    from dolfinx_rans.utils import compute_cf_along_wall
+
+    comm = domain.comm
+    h = geom.step_height
+    L_down = geom.downstream_length * h
+
+    x_coords = np.linspace(0.5 * h, L_down * 0.98, 300)
+    cf = compute_cf_along_wall(u, domain, nu, x_coords, y_wall=0.0)
+
+    if comm.rank != 0:
+        return
+
+    x_over_h = x_coords / h
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(x_over_h, cf, "b-", linewidth=1.5)
+    ax.axhline(0.0, color="gray", linestyle="--", linewidth=0.8)
+    if x_r is not None:
+        ax.axvline(x_r / h, color="r", linestyle=":", linewidth=1.2,
+                   label=f"x_r/h = {x_r/h:.2f}")
+        ax.legend(fontsize=10)
+    ax.set_xlabel("x/h")
+    ax.set_ylabel("Cf")
+    ax.set_title(f"Skin friction (BFS, ER={geom.expansion_ratio})")
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        print(f"  Saved Cf plot: {save_path}")
+    plt.close(fig)
+
+
+def plot_bfs_profiles(u, k, nu_t, domain, geom, nu, x_stations_over_h=None, save_path=None):
+    """
+    Plot vertical profiles at multiple x/h stations downstream of the step.
+
+    Shows u-velocity and TKE profiles at each station, revealing
+    separated shear layer evolution and recovery.
+
+    All ranks participate in extraction; only rank 0 plots.
+
+    Args:
+        u: Velocity vector function
+        k: TKE function
+        nu_t: Eddy viscosity function
+        domain: DOLFINx mesh
+        geom: BFSGeom
+        nu: Kinematic viscosity
+        x_stations_over_h: List of x/h values for profiles (default: [1,2,4,6,8,10])
+        save_path: Path to save PNG (optional)
+    """
+    comm = domain.comm
+    h = geom.step_height
+    ER = geom.expansion_ratio
+    H_inlet = h / (ER - 1.0)
+    H_outlet = H_inlet + h
+
+    if x_stations_over_h is None:
+        L_down = geom.downstream_length
+        # Reasonable default stations
+        x_stations_over_h = [x for x in [1, 2, 4, 6, 8, 10, 15] if x < L_down * 0.9]
+
+    n_stations = len(x_stations_over_h)
+    n_points = 100
+    y_vals = np.linspace(0.001, H_outlet - 0.001, n_points)
+
+    # Extract profiles at each station (ALL ranks)
+    u_profiles = []
+    k_profiles = []
+    for xh in x_stations_over_h:
+        x_val = xh * h
+        u_prof, k_prof = extract_fields_on_line(
+            [u.sub(0), k], y_vals, x_val, domain, comm=comm,
+        )
+        u_profiles.append(u_prof)
+        k_profiles.append(k_prof)
+
+    # Plot (rank 0 only)
+    if comm.rank != 0:
+        return
+
+    colors = plt.cm.viridis(np.linspace(0.1, 0.9, n_stations))
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+    # Velocity profiles
+    ax = axes[0]
+    for i, xh in enumerate(x_stations_over_h):
+        ax.plot(u_profiles[i], y_vals / h, color=colors[i], linewidth=1.3,
+                label=f"x/h={xh}")
+    ax.axhline(1.0, color="gray", linestyle="--", linewidth=0.6, alpha=0.5)
+    ax.set_xlabel("u")
+    ax.set_ylabel("y/h")
+    ax.set_title("Streamwise velocity profiles")
+    ax.legend(fontsize=8, ncol=2)
+    ax.grid(True, alpha=0.3)
+
+    # TKE profiles
+    ax = axes[1]
+    for i, xh in enumerate(x_stations_over_h):
+        ax.plot(k_profiles[i], y_vals / h, color=colors[i], linewidth=1.3,
+                label=f"x/h={xh}")
+    ax.axhline(1.0, color="gray", linestyle="--", linewidth=0.6, alpha=0.5)
+    ax.set_xlabel("k")
+    ax.set_ylabel("y/h")
+    ax.set_title("TKE profiles")
+    ax.legend(fontsize=8, ncol=2)
+    ax.grid(True, alpha=0.3)
+
+    fig.suptitle(f"BFS profiles: ER={geom.expansion_ratio}", fontsize=13)
+    plt.tight_layout()
+
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        print(f"  Saved BFS profiles plot: {save_path}")
+    plt.close(fig)
+
+
+def write_bfs_profile_csv(u, k, omega, nu_t, domain, geom, nu, save_path,
+                           x_stations_over_h=None, n_points=200):
+    """
+    Export BFS vertical profiles at multiple x/h stations to CSV.
+
+    Output columns:
+        x_over_h, y, y_over_h, u, k, omega, nu_t_over_nu
+
+    Args:
+        u, k, omega, nu_t: Solution fields
+        domain: DOLFINx mesh
+        geom: BFSGeom
+        nu: Kinematic viscosity
+        save_path: Output CSV path
+        x_stations_over_h: List of x/h values (default: [1,2,4,6,8,10])
+        n_points: Points per profile
+    """
+    comm = domain.comm
+    h = geom.step_height
+    ER = geom.expansion_ratio
+    H_inlet = h / (ER - 1.0)
+    H_outlet = H_inlet + h
+
+    if x_stations_over_h is None:
+        L_down = geom.downstream_length
+        x_stations_over_h = [x for x in [1, 2, 4, 6, 8, 10, 15] if x < L_down * 0.9]
+
+    eps = 1e-6
+    y_vals = np.linspace(eps, H_outlet - eps, n_points)
+
+    all_rows = []
+    for xh in x_stations_over_h:
+        x_val = xh * h
+        u_prof, k_prof, w_prof, nut_prof = extract_fields_on_line(
+            [u.sub(0), k, omega, nu_t], y_vals, x_val, domain, comm=comm,
+        )
+        for j in range(n_points):
+            all_rows.append([xh, y_vals[j], y_vals[j] / h,
+                             u_prof[j], k_prof[j], w_prof[j], nut_prof[j] / nu])
+
+    if comm.rank != 0:
+        return
+
+    data = np.array(all_rows)
+    Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+    np.savetxt(
+        save_path,
+        data,
+        delimiter=",",
+        header="x_over_h,y,y_over_h,u,k,omega,nu_t_over_nu",
+        comments="",
+    )
+    print(f"  Saved BFS profiles CSV: {save_path}")

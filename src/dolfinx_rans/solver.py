@@ -1123,7 +1123,10 @@ def solve_rans_kw(
         # PNG plots -- decoupled from VTX
         if do_snapshot:
             # Flow fields: all ranks must participate (MPI-safe extraction)
-            if not is_bfs:  # Live field plots are channel-specific for now
+            if is_bfs:
+                from dolfinx_rans.plotting import plot_bfs_fields
+                plot_bfs_fields(u_, p_, k_, omega_, nu_t_, domain, geom, nu, save_path=results_dir / "fields.png")
+            else:
                 _plot_fields_live(u_, p_, k_, omega_, nu_t_, domain, geom, Re_tau, step, results_dir / "fields.png")
             if comm.rank == 0:
                 # Residual history: reads CSV, no MPI needed
