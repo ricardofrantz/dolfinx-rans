@@ -756,11 +756,19 @@ def mark_bfs_boundaries(domain, geom: BFSGeom):
     )
 
 
-def initial_velocity_bfs(x, U_inlet, H_outlet):
-    """Parabolic initial velocity profile spanning the full outlet height."""
-    eta = x[1] / H_outlet
+def initial_velocity_bfs(x, U_inlet, H_outlet, H_inlet):
+    """Parabolic velocity profile over the inlet channel height.
+
+    The inlet occupies y in [H_outlet - H_inlet, H_outlet]. The parabola
+    peaks at the channel centre and is zero at both walls. Outside the
+    inlet channel (below the step), velocity is zero.
+    """
+    y_bottom = H_outlet - H_inlet
+    eta = (x[1] - y_bottom) / H_inlet
+    eta = np.clip(eta, 0.0, 1.0)
     u_profile = 1.5 * U_inlet * 4.0 * eta * (1.0 - eta)
-    u_profile = np.maximum(u_profile, 0.0)
+    # Zero velocity below the step (y < y_bottom)
+    u_profile = np.where(x[1] < y_bottom, 0.0, u_profile)
     return np.vstack([
         u_profile.astype(PETSc.ScalarType),
         np.zeros(x.shape[1], dtype=PETSc.ScalarType),

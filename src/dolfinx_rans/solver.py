@@ -537,7 +537,7 @@ def solve_rans_kw(
 
     # Initial conditions — geometry-dispatched
     if is_bfs:
-        u_n.interpolate(lambda x: initial_velocity_bfs(x, u_bulk_init, Ly))
+        u_n.interpolate(lambda x: initial_velocity_bfs(x, u_bulk_init, Ly, H))
         k_n.interpolate(lambda x: initial_k_bfs(x, u_bulk_init))
         omega_n.interpolate(lambda x: initial_omega_bfs(x, u_bulk_init, H))
     else:
@@ -567,7 +567,7 @@ def solve_rans_kw(
     if is_bfs:
         # BFS: add inlet velocity Dirichlet BC (parabolic profile)
         u_inlet_func = Function(V)
-        u_inlet_func.interpolate(lambda x: initial_velocity_bfs(x, u_bulk_init, Ly))
+        u_inlet_func.interpolate(lambda x: initial_velocity_bfs(x, u_bulk_init, Ly, H))
         inlet_dofs_V = locate_dofs_topological(V, fdim, inlet_facets)
         bc_inlet_u = dirichletbc(u_inlet_func, inlet_dofs_V)
         bcu.append(bc_inlet_u)

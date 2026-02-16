@@ -164,6 +164,38 @@ def gather_scalar_field(func, comm):
     return None, None, None
 
 
+def _mask_bfs_triangulation(x, y, geom):
+    """Create a Triangulation with BFS step region masked out.
+
+    Uses Delaunay triangulation but removes any triangle whose centroid
+    falls inside the solid step region (x < 0 and y < step height).
+
+    Returns:
+        matplotlib.tri.Triangulation with mask applied, or None if geom
+        is not a BFS geometry.
+    """
+    from matplotlib.tri import Triangulation
+    from dolfinx_rans.config import BFSGeom
+
+    if not isinstance(geom, BFSGeom):
+        return None
+
+    tri = Triangulation(x, y)
+    triangles = tri.triangles
+
+    # Centroid of each triangle
+    cx = np.mean(x[triangles], axis=1)
+    cy = np.mean(y[triangles], axis=1)
+
+    # Mask triangles inside the solid step (upstream of step AND below step top)
+    h = geom.step_height
+    ER = geom.expansion_ratio
+    y_step = h / (ER - 1.0)  # H_inlet = y-coordinate of step top
+    mask = (cx < 0) & (cy < y_step)
+    tri.set_mask(mask)
+    return tri
+
+
 def write_channel_profile_csv(u, k, omega, nu_t, domain, geom, Re_tau, save_path: Path, n_points: int = 256):
     """
     Export centerline-normalized channel profiles for RANS benchmark comparison.
@@ -594,12 +626,20 @@ def plot_final_fields(
 
 
 def _tricontour(ax, x, y, vals, label, geom=None, n_levels=32):
-    """Helper for tricontourf with safe level handling and correct aspect ratio."""
+    """Helper for tricontourf with safe level handling and correct aspect ratio.
+
+    For BFS geometry, masks Delaunay triangles inside the solid step region.
+    """
     vmin, vmax = np.min(vals), np.max(vals)
     if vmax - vmin < 1e-15:
         vmax = vmin + 1e-10  # Avoid zero-range levels (e.g., early iterations)
     levels = np.linspace(vmin, vmax, n_levels)
-    tcf = ax.tricontourf(x, y, vals, levels=levels, cmap="viridis")
+    # Build masked triangulation for BFS (removes step interior)
+    tri = _mask_bfs_triangulation(x, y, geom)
+    if tri is not None:
+        tcf = ax.tricontourf(tri, vals, levels=levels, cmap="viridis")
+    else:
+        tcf = ax.tricontourf(x, y, vals, levels=levels, cmap="viridis")
     ax.set_aspect("equal")
     ax.set_xlabel("x")
     ax.set_ylabel("y")
@@ -685,6 +725,7 @@ def plot_bfs_fields(u, p, k, omega, nu_t, domain, geom, nu, save_path=None):
     Plot 2D contour fields for backward-facing step.
 
     Shows u, v, k, nu_t/nu as colormaps over the L-shaped domain.
+    Uses actual mesh triangulation to avoid Delaunay artifacts across the step.
     All ranks participate in gathering data; only rank 0 plots.
 
     Args:
@@ -709,17 +750,17 @@ def plot_bfs_fields(u, p, k, omega, nu_t, domain, geom, nu, save_path=None):
     h = geom.step_height
     fig, axes = plt.subplots(2, 2, figsize=(16, 6))
 
-    _tricontour(axes[0, 0], ux_x, ux_y, ux_vals, f"u (streamwise)")
-    _tricontour(axes[0, 1], uy_x, uy_y, uy_vals, f"v (wall-normal)")
-    _tricontour(axes[1, 0], k_x, k_y, k_vals, "k (TKE)")
+    _tricontour(axes[0, 0], ux_x, ux_y, ux_vals, "u (streamwise)", geom=geom)
+    _tricontour(axes[0, 1], uy_x, uy_y, uy_vals, "v (wall-normal)", geom=geom)
+    _tricontour(axes[1, 0], k_x, k_y, k_vals, "k (TKE)", geom=geom)
     nut_ratio = nut_vals / nu
-    _tricontour(axes[1, 1], nut_x, nut_y, nut_ratio, f"nu_t/nu (max={np.max(nut_ratio):.0f})")
+    _tricontour(axes[1, 1], nut_x, nut_y, nut_ratio, f"nu_t/nu (max={np.max(nut_ratio):.0f})", geom=geom)
 
     fig.suptitle(f"BFS fields: h={h}, ER={geom.expansion_ratio}", fontsize=13)
     plt.tight_layout()
 
     if save_path:
-        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
         print(f"  Saved BFS fields plot: {save_path}")
     plt.close(fig)
 
@@ -769,7 +810,7 @@ def plot_bfs_cf(u, domain, geom, nu, x_r=None, save_path=None):
     plt.tight_layout()
 
     if save_path:
-        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
         print(f"  Saved Cf plot: {save_path}")
     plt.close(fig)
 
@@ -855,7 +896,7 @@ def plot_bfs_profiles(u, k, nu_t, domain, geom, nu, x_stations_over_h=None, save
     plt.tight_layout()
 
     if save_path:
-        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
         print(f"  Saved BFS profiles plot: {save_path}")
     plt.close(fig)
 
