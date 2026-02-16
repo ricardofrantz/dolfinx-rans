@@ -4,8 +4,8 @@ Extract and compare NekStab Poiseuille baseflow profiles.
 
 This script reads a Nek5000 field from a poiseuille_RANS case, exports:
   - outer-scaled profile CSV/DAT
-  - wall-unit profile CSV (derived from case viscosity + estimated wall gradient)
-  - run.sh-compatible reference CSV with columns: y_plus,u_plus
+  - inner-unit profile CSV (optional compatibility)
+  - run.sh-compatible reference CSV with columns: y_over_delta,u_over_ubulk
   - optional overlay plots against one or more dolfinx-rans profiles.csv files
 
 Usage example:
@@ -150,19 +150,55 @@ def _load_dolfinx_profile(path: Path) -> dict:
     rows = list(csv.DictReader(path.open()))
     if not rows:
         raise ValueError(f"Empty DOLFINx profile CSV: {path}")
-    required = ("y", "y_plus", "u_plus")
+    required = ("y",)
     for col in required:
         if col not in rows[0]:
             raise ValueError(f"{path} missing required column '{col}'")
     y = np.array([float(r["y"]) for r in rows])
-    y_plus = np.array([float(r["y_plus"]) for r in rows])
-    u_plus = np.array([float(r["u_plus"]) for r in rows])
+
+    y_over_delta = np.array([float(r["y_over_delta"]) for r in rows], dtype=float) if "y_over_delta" in rows[0] else None
+    if y_over_delta is not None and not np.all(np.isfinite(y_over_delta)):
+        y_over_delta = None
+
+    if "y_plus" in rows[0]:
+        y_plus = np.array([float(r["y_plus"]) for r in rows], dtype=float)
+    else:
+        y_plus = np.array([np.nan] * len(rows), dtype=float)
+
+    u_over_ubulk = None
+    if "u_over_ubulk" in rows[0]:
+        u_over_ubulk = np.array([float(r["u_over_ubulk"]) for r in rows], dtype=float)
+    elif "u" in rows[0]:
+        u_data = np.array([float(r["u"]) for r in rows], dtype=float)
+        y_for_bulk = y_over_delta
+        if y_for_bulk is None:
+            re_tau = float(rows[0].get("Re_tau", float("nan"))) if "Re_tau" in rows[0] else float("nan")
+            if np.isfinite(re_tau) and re_tau > 0:
+                y_for_bulk = y_plus / re_tau
+        if y_for_bulk is not None and np.all(np.isfinite(y_for_bulk)):
+            bulk = float(np.trapezoid(u_data, y_for_bulk) / max(y_for_bulk[-1] - y_for_bulk[0], 1e-30))
+            u_over_ubulk = u_data / max(bulk, 1e-30)
+    elif "u_plus" in rows[0]:
+        u_data = np.array([float(r["u_plus"]) for r in rows], dtype=float)
+        if y_plus is not None and np.all(np.isfinite(y_plus)):
+            re_tau = float(rows[0].get("Re_tau", np.nan))
+            if np.isfinite(re_tau) and re_tau > 0:
+                y_for_bulk = y_plus / re_tau
+                bulk = float(np.trapezoid(u_data, y_for_bulk) / max(y_for_bulk[-1] - y_for_bulk[0], 1e-30))
+                u_over_ubulk = u_data / max(bulk, 1e-30)
+    else:
+        raise ValueError(f"{path} missing velocity column (expected 'u' or 'u_plus')")
+    if u_over_ubulk is None:
+        u_over_ubulk = np.full_like(y, np.nan, dtype=float)
+
     return {
         "path": str(path),
         "label": path.parent.name if path.parent.name else path.stem,
         "y": y,
+        "y_over_delta": y_over_delta,
         "y_plus": y_plus,
-        "u_plus": u_plus,
+        "u_plus": np.array([float(r["u_plus"]) for r in rows], dtype=float) if "u_plus" in rows[0] else np.full_like(y, np.nan, dtype=float),
+        "u_over_ubulk": u_over_ubulk,
     }
 
 
@@ -213,7 +249,7 @@ def main() -> None:
         for yy, uu in zip(y_wall, u_mean):
             f.write(f"{yy:.16e} {(uu / u_bulk):.16e}\n")
 
-    # 2) Wall units (derived) + 3) run.sh-compatible reference profile
+    # 2) Inner-unit diagnostics + 3) run.sh-compatible outer-profile gate
     _write_csv(
         out_dir / "nek_profile_wall_units.csv",
         ["y_over_delta", "y_plus", "u_plus"],
@@ -222,8 +258,8 @@ def main() -> None:
     # Gate input format expected by run.sh
     _write_csv(
         out_dir / "nek_reference_profile.csv",
-        ["y_plus", "u_plus"],
-        [[yp, up] for yp, up in zip(y_plus, u_plus)],
+        ["y_over_delta", "u_over_ubulk"],
+        [[yy, uu / u_bulk] for yy, uu in zip(y_wall, u_mean)],
     )
 
     dolfinx = []
@@ -237,10 +273,14 @@ def main() -> None:
     plt.figure(figsize=(7, 5))
     plt.plot(y_wall, u_mean / u_bulk, linewidth=2.0, label="Nek (outer)")
     for d in dolfinx:
-        # For this solver in nondim mode u_plus == u (u_tau=1 internal scaling)
-        u = d["u_plus"]
-        u_bulk_d = float(np.trapz(u, d["y"]) / max(d["y"][-1] - d["y"][0], 1e-30))
-        plt.plot(d["y"], u / u_bulk_d, linewidth=1.5, label=f"{d['label']} (outer)")
+        u = d["u_over_ubulk"]
+        if d["y_over_delta"] is not None and np.any(np.isfinite(d["y_over_delta"])):
+            y_profile = d["y_over_delta"]
+        else:
+            y_profile = d["y"]
+        valid = np.isfinite(y_profile) & np.isfinite(u)
+        if np.any(valid):
+            plt.plot(np.asarray(y_profile)[valid], np.asarray(u)[valid], linewidth=1.5, label=f"{d['label']} (outer)")
     plt.xlabel("y/delta")
     plt.ylabel("U/U_bulk")
     plt.title("Mean Velocity Profile (Outer Scaling)")
@@ -254,7 +294,8 @@ def main() -> None:
     plt.figure(figsize=(7, 5))
     plt.semilogx(y_plus[1:], u_plus[1:], linewidth=2.0, label="Nek (derived wall units)")
     for d in dolfinx:
-        plt.semilogx(d["y_plus"][1:], d["u_plus"][1:], linewidth=1.5, label=d["label"])
+        if np.all(np.isfinite(d["y_plus"])):
+            plt.semilogx(d["y_plus"][1:], d["u_plus"][1:], linewidth=1.5, label=d["label"])
     plt.xlabel("y+")
     plt.ylabel("u+")
     plt.title("Mean Velocity Profile (Wall Units)")
@@ -267,10 +308,12 @@ def main() -> None:
     # Quantify outer-shape error where overlays were supplied
     rmse_outer = {}
     for d in dolfinx:
-        u = d["u_plus"]
-        u_bulk_d = float(np.trapz(u, d["y"]) / max(d["y"][-1] - d["y"][0], 1e-30))
-        u_outer_d = u / u_bulk_d
-        interp_d = np.interp(y_wall, d["y"], u_outer_d)
+        u = d["u_over_ubulk"]
+        y_profile = d["y_over_delta"] if (d["y_over_delta"] is not None and np.any(np.isfinite(d["y_over_delta"]))) else d["y"]
+        valid = np.isfinite(y_profile) & np.isfinite(u)
+        if not np.any(valid):
+            continue
+        interp_d = np.interp(y_wall, np.asarray(y_profile)[valid], np.asarray(u)[valid])
         rmse = float(np.sqrt(np.mean((interp_d - (u_mean / u_bulk)) ** 2)))
         rmse_outer[d["label"]] = rmse
 
@@ -296,8 +339,8 @@ def main() -> None:
         "outer_rmse_vs_dolfinx": rmse_outer,
         "notes": [
             "Nek Re is read from poiseuille_RANS.par viscosity convention (negative value means Re).",
-            "Wall-units are derived from near-wall slope of extracted baseflow and are approximate.",
-            "Use nek_reference_profile.csv for run.sh reference_profile_csv gate input.",
+            "Nek wall-units are derived from near-wall slope of extracted baseflow and are approximate.",
+            "Use nek_reference_profile.csv (y_over_delta,u_over_ubulk) for run.sh reference_profile_csv gate input.",
         ],
     }
     (out_dir / "metadata.json").write_text(json.dumps(meta, indent=2) + "\n")

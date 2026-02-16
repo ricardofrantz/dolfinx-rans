@@ -1,0 +1,26 @@
+{
+  "nek_case_dir": "/home/rfrantz/nekStab/example/poiseuille_RANS",
+  "nek_field": "/home/rfrantz/nekStab/example/poiseuille_RANS/BF_poiseuille_RANS0.f00001",
+  "nek_time": 196.5509840257,
+  "domain_bounds": {
+    "x_min": 0.0,
+    "x_max": 6.283185307179586,
+    "y_min": -1.0,
+    "y_max": 1.0
+  },
+  "viscosity_from_par": 1e-05,
+  "re_from_par": 100000.0,
+  "estimated_wall_quantities": {
+    "du_dy_wall": 12.450512848786893,
+    "tau_wall": 0.00012450512848786893,
+    "u_tau": 0.01115818661288065,
+    "re_tau": 1115.818661288065
+  },
+  "u_bulk_outer_scale": 0.9984901828353354,
+  "outer_rmse_vs_dolfinx": {},
+  "notes": [
+    "Nek Re is read from poiseuille_RANS.par viscosity convention (negative value means Re).",
+    "Nek wall-units are derived from near-wall slope of extracted baseflow and are approximate.",
+    "Use nek_reference_profile.csv (y_over_delta,u_over_ubulk) for run.sh reference_profile_csv gate input."
+  ]
+}
