@@ -1199,7 +1199,10 @@ def solve_rans_kw(
                 save_path = results_dir / f"bfs_fields{step:07d}.png"
                 plot_bfs_fields(u_, p_, k_, omega_, nu_t_, domain, geom, nu, save_path=save_path)
             else:
-                _plot_fields_live(u_, p_, k_, omega_, nu_t_, domain, geom, Re_tau, step, results_dir / "fields.png")
+                _plot_fields_live(
+                    u_, p_, k_, omega_, nu_t_, domain, geom, Re_tau, step,
+                    results_dir / f"fields{step:07d}.png",
+                )
 
         # Convergence check
         if residual < solve.steady_tol and (not solve.enable_physical_convergence or physical_converged):

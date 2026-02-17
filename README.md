@@ -315,7 +315,7 @@ A single JSON file controls the entire simulation. Core sections (`geom`, `nondi
     "under_relax_nu_t": 0.4,
     "log_interval": 10,
     "snapshot_interval": 50,
-    "out_dir": "channel"
+    "out_dir": "results"
   },
   "benchmark": {
     "reference_profile_csv": ""
@@ -781,7 +781,7 @@ dolfinx-rans/
 │   ├── bfs.jsonc         — BFS canonical case (JSONC with inline comments)
 │   └── ...
 ├── channel/
-│   └── run_config.json   — Canonical case configuration
+│   └── channel.jsonc   — Canonical case configuration
 ├── run_channel.sh         — One-command runner for channel case
 ├── run_bfs.sh             — One-command runner for BFS case
 └── pyproject.toml         — Package metadata (hatchling build system)

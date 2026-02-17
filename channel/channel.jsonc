@@ -1,0 +1,57 @@
+{
+  "_meta": {
+    "purpose": "Canonical channel benchmark", // single production case
+    "reference": "Nek poiseuille_RANS benchmark parity for Re_τ=1115.8187", // validation reference
+    "notes": "Keep only this file in channel/ and clear channel/results to rerun." // workflow note
+  },
+  "geom": {
+    "Lx": 1.0, // domain length
+    "Ly": 2.0, // full channel height
+    "Nx": 192, // streamwise cells
+    "Ny": 166, // wall-normal cells
+    "mesh_type": "quad", // element type
+    "y_first": 0.001604628, // first wall-normal spacing
+    "growth_rate": 1.0, // wall-normal growth ratio
+    "stretching": "tanh", // spacing law
+    "y_first_tol_rel": 0.2, // tolerance for realized y_first
+    "use_symmetry": false // full-height channel
+  },
+  "nondim": {
+    "Re_tau": 1115.818661288065, // target friction Reynolds number
+    "use_body_force": true // body-force-driven setup
+  },
+  "turb": {
+    "model": "wilcox2006", // turbulence model
+    "beta_star": 0.09, // Wilcox constant
+    "nu_t_max_factor": 2000.0, // ν_t/ν cap
+    "omega_min": 1.0, // ω floor
+    "k_min": 1e-10, // k floor
+    "k_max": 20.0, // k cap
+    "C_lim": 0.0 // Durbin limiter
+  },
+  "solve": {
+    "dt": 0.005, // legacy-style initial step (CFL caps this initially)
+    "dt_max": 0.01, // max pseudo-time step
+    "dt_growth": 1.05, // dt growth factor
+    "dt_growth_threshold": 0.8, // residual-ratio threshold to grow dt
+    "cfl_target": 0.25, // mapped from legacy CFL_RELAXATION
+    "t_final": 10000.0, // pseudo-time safety cap
+    "max_iter": 3000, // max outer iterations
+    "steady_tol": 1e-6, // steady residual tolerance
+    "enable_physical_convergence": false, // disable physical convergence gate
+    "physical_u_bulk_rel_tol": 1e-4, // U_bulk gate tolerance
+    "physical_tau_wall_rel_tol": 2.5e-3, // τ_wall gate tolerance
+    "physical_convergence_start_iter": 10, // gate starts here
+    "picard_max": 6, // Picard iterations per step
+    "picard_tol": 1e-4, // Picard tolerance
+    "under_relax_k_omega": 0.6, // k and ω under-relaxation
+    "under_relax_nu_t": 0.4, // ν_t under-relaxation
+    "log_interval": 10, // diagnostic print interval
+    "snapshot_interval": 50, // VTX snapshot interval
+    "out_dir": "results", // writes to case/results
+    "min_iter": 50 // minimum iterations before convergence
+  },
+  "benchmark": {
+    "reference_profile_csv": "" // optional benchmark profile
+  }
+}

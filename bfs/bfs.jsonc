@@ -1,59 +1,59 @@
 {
   "_meta": {
-    "purpose": "Backward-facing step test case (ported from https://github.com/joove123/k-epsilon/blob/main/BackStepSimulation.py",
-    "notes": "Re_h=1000 target, coarse mesh for debug, ER=2 (H_inlet = h = 1).",
-    "source": "BackStepSimulation.py",
-    "source_note": "Legacy reference for parameter intent; solver remains k-omega."
+    "purpose": "Backward-facing step benchmark", // working BFS case
+    "notes": "Re_h target + ER=2 setup, adapted to dolfinx-rans.", // compatible parameter mapping from legacy joove case
+    "source": "https://github.com/joove123/k-epsilon/blob/main/Configs/ConfigBackStep.py", // legacy reference
+    "source_note": "Only compatible keys are retained; this solver uses a k-omega core and generated mesh." // scope note
   },
   "geometry": {
     "type": "bfs", // selects BFS geometry branch
-    "step_height": 1.0, // h = step height; keep =1 so ER=2 implies H_inlet=1
-    "expansion_ratio": 2.0, // H_outlet / H_inlet
-    "upstream_length": 5.0, // L_upstream/h
-    "downstream_length": 20.0, // L_downstream/h
-    "y_first": 0.005, // first wall-normal cell height
-    "Nx_upstream": 30, // streamwise cells in inlet section
-    "Nx_downstream": 120, // streamwise cells downstream
-    "Ny_inlet": 20, // inlet block Ny
-    "Ny_outlet": 40, // outlet block Ny
-    "mesh_type": "quad", // mesh cell type
-    "stretching": "geometric", // stretching policy
+    "step_height": 1.0, // h
+    "expansion_ratio": 2.0, // H_outlet/H_inlet
+    "upstream_length": 5.0, // L_upstream / h
+    "downstream_length": 20.0, // L_downstream / h
+    "y_first": 0.005, // first wall-normal spacing
+    "Nx_upstream": 30, // x-cells before step
+    "Nx_downstream": 120, // x-cells after step
+    "Ny_inlet": 20, // y-cells in inlet block
+    "Ny_outlet": 40, // y-cells in outlet block
+    "mesh_type": "quad", // mesh element type
+    "stretching": "geometric", // cell growth law
     "growth_rate": 1.15 // downstream growth ratio
   },
   "nondim": {
-    "Re_tau": 1000.0, // target Re_h converted into solver non-dimensional scaling
-    "use_body_force": false // keep body-force forcing off for BFS
+    "Re_tau": 1000.0, // target Reynolds parameter used by this solver
+    "use_body_force": false // force-free inlet/outlet-driven BFS setup
   },
   "turb": {
-    "model": "wilcox2006", // turbulence model
-    "beta_star": 0.09, // k-omega model constant
-    "nu_t_max_factor": 200.0, // ν_t/ν cap
-    "omega_min": 0.1, // lower bound on ω
-    "k_min": 1e-10, // lower bound on k
-    "k_max": 10.0, // upper bound on k
-    "C_lim": 0.875 // Durbin limiter (0 disables)
+    "model": "wilcox2006", // k-omega model
+    "beta_star": 0.09, // turbulence constant
+    "nu_t_max_factor": 200.0, // ν_t/ν limiter
+    "omega_min": 0.1, // ω floor
+    "k_min": 1e-10, // k floor
+    "k_max": 10.0, // k cap
+    "C_lim": 0.875 // realizability limiter
   },
   "solve": {
     "dt": 0.01, // initial pseudo-time step
     "dt_max": 0.15, // max pseudo-time step
-    "dt_growth": 1.01, // dt growth factor
-    "dt_growth_threshold": 0.95, // residual-ratio threshold for dt growth
-    "cfl_target": 0.7, // CFL target
-    "t_final": 500000.0, // pseudo-time cap
+    "dt_growth": 1.05, // grow dt if residual trend improves
+    "dt_growth_threshold": 0.8, // grow only if residual ratio < threshold
+    "cfl_target": 0.7, // Joove-style stability target in spirit
+    "t_final": 500000.0, // pseudo-time safety cap
     "max_iter": 3000, // max outer iterations
-    "steady_tol": 1e-6, // outer residual tolerance
-    "enable_physical_convergence": false, // skip physical convergence gate for now
-    "physical_u_bulk_rel_tol": 1e-4, // u_bulk physical tolerance
-    "physical_tau_wall_rel_tol": 2.5e-3, // tau_wall physical tolerance
-    "physical_convergence_start_iter": 10, // first iter to allow physical gate
-    "picard_max": 6, // Picard iterations
-    "picard_tol": 1e-6, // Picard tolerance
-    "under_relax_k_omega": 0.1, // under-relax k and omega
-    "under_relax_nu_t": 0.1, // under-relax nu_t
-    "log_interval": 10, // print every N iterations
-    "snapshot_interval": 200, // VTX snapshot interval
-    "out_dir": "bfs", // output folder root
-    "min_iter": 100, // minimum iterations before convergence
-    "min_dt_ratio": 1.0e-3 // min dt ratio for convergence
+    "steady_tol": 1e-6, // residual convergence tolerance
+    "enable_physical_convergence": false, // keep solver-only convergence criterion enabled
+    "physical_u_bulk_rel_tol": 1e-4, // U_bulk gate
+    "physical_tau_wall_rel_tol": 2.5e-3, // τ_w gate
+    "physical_convergence_start_iter": 10, // physical gate starts here
+    "picard_max": 6, // Picard iterations per step
+    "picard_tol": 1e-6, // Picard inner convergence
+    "under_relax_k_omega": 0.1, // under-relax k and ω
+    "under_relax_nu_t": 0.1, // under-relax ν_t
+    "log_interval": 10, // console logging interval
+    "snapshot_interval": 200, // VTX + field plot interval
+    "out_dir": "results", // writes to case/results
+    "min_iter": 200, // prevent premature convergence
+    "min_dt_ratio": 0.001 // floor dt at 0.1% of initial dt
   }
 }

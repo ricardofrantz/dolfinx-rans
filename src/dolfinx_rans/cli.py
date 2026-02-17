@@ -84,6 +84,22 @@ def _detect_geometry_type(cfg: dict) -> str:
     raise ValueError("Config must have either 'geometry' or 'geom' section")
 
 
+def _resolve_case_and_results_dirs(
+    cfg_path: Path, out_dir: str
+) -> tuple[Path, Path]:
+    """Resolve case and results directories from config path and solve.out_dir."""
+    requested = Path(out_dir)
+    if not requested.is_absolute():
+        requested = (cfg_path.parent / requested).resolve()
+    if requested.name == "results":
+        case_dir = requested.parent
+        results_dir = requested
+    else:
+        case_dir = requested
+        results_dir = requested / "results"
+    return case_dir, results_dir
+
+
 def _run_channel(cfg, cfg_path, args, turb, solve_params):
     """Run channel flow case."""
     # Parse channel-specific config
@@ -100,11 +116,10 @@ def _run_channel(cfg, cfg_path, args, turb, solve_params):
         print_dc_json(nondim)
         return 0
 
-    case_dir = Path(solve_params.out_dir)
+    case_dir, results_dir = _resolve_case_and_results_dirs(cfg_path, solve_params.out_dir)
     if MPI.COMM_WORLD.rank == 0:
         prepare_case_dir(case_dir, config_path=cfg_path, cfg=cfg, snps_subdir="snps")
     MPI.COMM_WORLD.barrier()
-    results_dir = case_dir / "results"
 
     if MPI.COMM_WORLD.rank == 0:
         print("=" * 60)
@@ -164,11 +179,10 @@ def _run_bfs(cfg, cfg_path, args, turb, solve_params):
         print_dc_json(nondim)
         return 0
 
-    case_dir = Path(solve_params.out_dir)
+    case_dir, results_dir = _resolve_case_and_results_dirs(cfg_path, solve_params.out_dir)
     if MPI.COMM_WORLD.rank == 0:
         prepare_case_dir(case_dir, config_path=cfg_path, cfg=cfg, snps_subdir="snps")
     MPI.COMM_WORLD.barrier()
-    results_dir = case_dir / "results"
 
     h = geom.step_height
     ER = geom.expansion_ratio
