@@ -551,6 +551,11 @@ def solve_rans_kw(
         if nondim is not None and nondim.epsilon_inlet > 0:
             # Direct epsilon inlet (k-epsilon model)
             scalar_inlet_val = nondim.epsilon_inlet
+        elif turb.model == "kepsilon":
+            raise ValueError(
+                "k-epsilon model requires explicit epsilon_inlet in nondim config "
+                "(auto-compute from omega is unreliable for k-epsilon)"
+            )
         else:
             omega_inlet_val = np.sqrt(k_inlet_val) / max(0.07 * H, 1e-10)
             scalar_inlet_val = model.compute_inlet_scalar(k_inlet_val, omega_inlet_val)
@@ -819,6 +824,7 @@ def solve_rans_kw(
             assemble_vector(b, L)
             apply_lifting(b, [a], [bcs])
         b.ghostUpdate(addv=PETSc.InsertMode.ADD_VALUES, mode=PETSc.ScatterMode.REVERSE)
+        # Safe: Dirichlet DOFs (walls) and MPC slaves (right boundary) are disjoint
         set_bc(b, bcs)
 
     def _reassemble_vector_no_bc(b, L, mpc=None):
@@ -1008,12 +1014,12 @@ def solve_rans_kw(
             k_norm = float(np.sqrt(comm.allreduce(np.dot(k_.x.array, k_.x.array), op=MPI.SUM)))
             res_k_val = dk_norm / max(k_norm, 1e-10)
 
-            if res_k_val < solve.picard_tol:
-                break
-
             k_prev.x.array[:] = k_.x.array
             omega_prev.x.array[:] = omega_.x.array
             nu_t_old.x.array[:] = nu_t_.x.array
+
+            if res_k_val < solve.picard_tol:
+                break
 
         # Compute residuals
         res_u = field_residual(u_.x.array, u_n_old)
