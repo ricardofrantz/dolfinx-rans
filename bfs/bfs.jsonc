@@ -31,7 +31,7 @@
     "model": "kepsilon", // k-epsilon Lam-Bremhorst (matches joove reference)
     "beta_star": 0.09, // turbulence constant
     "nu_t_max_factor": 2000.0, // ν_t/ν limiter (Re_h=137500 → large ν_t)
-    "omega_min": 0.1, // ω floor (unused by k-epsilon)
+    "omega_min": 0.1, // ω floor (used in IC conversion, not in transport eqn)
     "k_min": 1e-10, // k floor
     "k_max": 100.0, // k cap (inlet k=1.73, dimensional)
     "C_lim": 0.0 // not used by k-epsilon

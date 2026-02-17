@@ -600,6 +600,8 @@ def solve_rans_kw(
             )
 
     # ── Periodic BCs via dolfinx_mpc (channel only) ──────────────
+    if use_body_force and is_bfs:
+        raise ValueError("use_body_force=True is not supported for BFS geometry")
     if use_body_force:
         if not HAVE_MPC:
             raise RuntimeError(
@@ -644,6 +646,8 @@ def solve_rans_kw(
         # Backsubstitute ICs so slave DOFs satisfy the periodic constraint
         for fn in [u_n, u_n1, u_]:
             mpc_V.backsubstitution(fn)
+        for fn in [p_, phi]:
+            mpc_Q.backsubstitution(fn)
         for fn in [k_n, k_, k_prev, omega_n, omega_, omega_prev]:
             mpc_S.backsubstitution(fn)
     else:
