@@ -20,12 +20,46 @@ from typing import Any, Mapping, TypeVar
 T = TypeVar("T")
 
 
+def _strip_json_comments(text: str) -> str:
+    """Strip `//` comments while preserving string literals."""
+    out_lines = []
+    for line in text.splitlines():
+        in_string = False
+        escaped = False
+        out = []
+        i = 0
+        while i < len(line):
+            ch = line[i]
+            if escaped:
+                out.append(ch)
+                escaped = False
+                i += 1
+                continue
+            if ch == "\\" and in_string:
+                escaped = True
+                out.append(ch)
+                i += 1
+                continue
+            if ch == '"' and not escaped:
+                in_string = not in_string
+                out.append(ch)
+                i += 1
+                continue
+            if not in_string and ch == "/" and i + 1 < len(line) and line[i + 1] == "/":
+                break
+            out.append(ch)
+            i += 1
+        out_lines.append("".join(out))
+    return "\n".join(out_lines)
+
+
 def load_json_config(config_path: str | Path) -> dict[str, Any]:
     """Load JSON configuration file."""
     p = Path(config_path)
     if not p.exists():
         raise FileNotFoundError(f"Config not found: {p}")
-    return json.loads(p.read_text())
+    raw = p.read_text()
+    return json.loads(_strip_json_comments(raw))
 
 
 def dc_from_dict(cls: type[T], data: Mapping[str, Any] | None, *, name: str = "config") -> T:
