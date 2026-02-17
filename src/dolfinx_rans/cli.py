@@ -121,10 +121,12 @@ def _run_channel(cfg, cfg_path, args, turb, solve_params):
         prepare_case_dir(case_dir, config_path=cfg_path, cfg=cfg, snps_subdir="snps")
     MPI.COMM_WORLD.barrier()
 
+    nprocs = MPI.COMM_WORLD.size
     if MPI.COMM_WORLD.rank == 0:
         print("=" * 60)
         print(f"RANS CHANNEL FLOW ({turb.model}) - dolfinx-rans")
         print("=" * 60)
+        print(f"MPI ranks: {nprocs}")
         print(f"Mode: NONDIMENSIONAL (Re_τ = {Re_tau})")
         print(f"Scaling: δ = 1, u_τ = 1, ν* = 1/Re_τ = {1.0/Re_tau:.6f}")
         stretch_mode = geom.stretching.lower()
@@ -189,11 +191,19 @@ def _run_bfs(cfg, cfg_path, args, turb, solve_params):
     H_inlet = h / (ER - 1.0)
     H_outlet = H_inlet + h
 
+    nprocs = MPI.COMM_WORLD.size
     if MPI.COMM_WORLD.rank == 0:
         print("=" * 60)
         print(f"RANS BACKWARD-FACING STEP ({turb.model}) - dolfinx-rans")
         print("=" * 60)
-        print(f"Re_τ = {nondim.Re_tau}")
+        print(f"MPI ranks: {nprocs}")
+        nu = 1.0 / nondim.Re_tau
+        U_in = nondim.U_inlet if nondim.U_inlet > 0 else 1.0
+        Re_h = U_in * h / nu
+        print(f"Re_τ = {nondim.Re_tau},  ν = {nu:.6e}")
+        print(f"U_inlet = {U_in},  Re_h = {Re_h:.0f}")
+        if nondim.k_inlet > 0 or nondim.epsilon_inlet > 0:
+            print(f"Inlet: k = {nondim.k_inlet}, ε = {nondim.epsilon_inlet}")
         print(f"Step height h = {h}, ER = {ER}")
         print(f"H_inlet = {H_inlet:.4f}, H_outlet = {H_outlet:.4f}")
         print(f"Mesh: {geom.Nx_upstream}+{geom.Nx_downstream} x {geom.Ny_outlet}")

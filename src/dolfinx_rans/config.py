@@ -63,6 +63,10 @@ class NondimParams:
 
     Re_tau: float  # Friction Reynolds number
     use_body_force: bool = True  # f_x = 1 to drive flow
+    # BFS inlet overrides (0 = auto-compute from turbulence intensity)
+    U_inlet: float = 0.0  # Inlet velocity magnitude (0 = use 1.0)
+    k_inlet: float = 0.0  # Inlet TKE (0 = 1.5 * (0.05 * U_inlet)^2)
+    epsilon_inlet: float = 0.0  # Inlet epsilon (0 = derived from k, omega)
 
 
 @dataclass(frozen=True)

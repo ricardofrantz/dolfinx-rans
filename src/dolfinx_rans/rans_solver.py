@@ -364,7 +364,7 @@ def solve_rans_kw(
         nu = 1.0 / Re_tau
         rho = 1.0
         use_body_force = False
-        u_bulk_init = 1.0
+        u_bulk_init = nondim.U_inlet if (nondim is not None and nondim.U_inlet > 0) else 1.0
     else:
         Ly = geom.Ly
         H = Ly if geom.use_symmetry else Ly / 2.0
@@ -542,10 +542,18 @@ def solve_rans_kw(
 
         # Inlet k and turbulence scalar Dirichlet BCs
         inlet_dofs_S = locate_dofs_topological(S, fdim, inlet_facets)
-        k_inlet_val = max(1.5 * (0.05 * u_bulk_init) ** 2, 1e-8)
-        omega_inlet_val = np.sqrt(k_inlet_val) / max(0.07 * H, 1e-10)
+        if nondim is not None and nondim.k_inlet > 0:
+            k_inlet_val = nondim.k_inlet
+        else:
+            k_inlet_val = max(1.5 * (0.05 * u_bulk_init) ** 2, 1e-8)
         bc_k_inlet = dirichletbc(PETSc.ScalarType(k_inlet_val), inlet_dofs_S, S)
-        scalar_inlet_val = model.compute_inlet_scalar(k_inlet_val, omega_inlet_val)
+
+        if nondim is not None and nondim.epsilon_inlet > 0:
+            # Direct epsilon inlet (k-epsilon model)
+            scalar_inlet_val = nondim.epsilon_inlet
+        else:
+            omega_inlet_val = np.sqrt(k_inlet_val) / max(0.07 * H, 1e-10)
+            scalar_inlet_val = model.compute_inlet_scalar(k_inlet_val, omega_inlet_val)
         bc_w_inlet = dirichletbc(PETSc.ScalarType(scalar_inlet_val), inlet_dofs_S, S)
     elif hasattr(geom, "use_symmetry") and geom.use_symmetry:
         # Channel symmetry BC at top: v=0 (y-component only)
