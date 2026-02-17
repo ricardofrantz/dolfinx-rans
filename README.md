@@ -778,12 +778,12 @@ dolfinx-rans/
 │   └── validation/
 │       └── nek_poiseuille_profile.py  — Nek5000 profile extraction and comparison
 ├── bfs/
-│   ├── bfs_quick.json   — BFS quick debug case
+│   ├── bfs.jsonc         — BFS canonical case (JSONC with inline comments)
 │   └── ...
 ├── channel/
 │   └── run_config.json   — Canonical case configuration
 ├── run_channel.sh         — One-command runner for channel case
-├── run_bfs.sh             — One-command runner for BFS quick case
+├── run_bfs.sh             — One-command runner for BFS case
 └── pyproject.toml         — Package metadata (hatchling build system)
 ```
 

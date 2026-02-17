@@ -2,15 +2,15 @@
 # run_bfs.sh — Run dolfinx-rans backward-facing step solver
 #
 # Usage:
-#   ./run_bfs.sh                           # Serial, default BFS quick config
-#   ./run_bfs.sh 8                         # 8 MPI processes, default BFS quick config
+#   ./run_bfs.sh                           # Serial, default BFS config
+#   ./run_bfs.sh 8                         # 8 MPI processes, default BFS config
 #   ./run_bfs.sh path/to/config.json        # Serial, custom config
 #   ./run_bfs.sh 4 path/to/config.json      # 4 MPI processes, custom config
 
 set -e  # Exit on error
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DEFAULT_CONFIG="$SCRIPT_DIR/bfs/bfs.json"
+DEFAULT_CONFIG="$SCRIPT_DIR/bfs/bfs.jsonc"
 
 # Parse arguments: [NPROCS] [CONFIG]
 NPROCS=1
@@ -23,7 +23,7 @@ else
     CONFIG_ARG="${1:-$DEFAULT_CONFIG}"
 fi
 
-if [[ "$CONFIG_ARG" == "default" || "$CONFIG_ARG" == "bfs" || "$CONFIG_ARG" == "bfs_quick" ]]; then
+if [[ "$CONFIG_ARG" == "default" || "$CONFIG_ARG" == "bfs" ]]; then
     CONFIG="$DEFAULT_CONFIG"
 else
     CONFIG="$CONFIG_ARG"
