@@ -53,6 +53,16 @@ from ufl import (
     rhs,
 )
 
+try:
+    from dolfinx_mpc import MultiPointConstraint
+    from dolfinx_mpc import apply_lifting as mpc_apply_lifting
+    from dolfinx_mpc import assemble_matrix as mpc_assemble_matrix
+    from dolfinx_mpc import assemble_vector as mpc_assemble_vector
+
+    HAVE_MPC = True
+except ImportError:
+    HAVE_MPC = False
+
 from dolfinx_rans.config import (
     BFSGeom,
     BoundaryInfo,
@@ -547,9 +557,13 @@ def solve_rans_kw(
         bc_sym_v = dirichletbc(zero_vy_solve, top_dofs_Vy_solve, V_y_sub)
         bcu.append(bc_sym_v)
 
-    outlet_dofs_Q = locate_dofs_topological(Q, fdim, outlet_facets)
-    bc_pressure = dirichletbc(PETSc.ScalarType(0.0), outlet_dofs_Q, Q)
-    bcp = [bc_pressure]
+    if use_body_force:
+        # Periodic channel: no pressure Dirichlet BC (gauge set by nullspace)
+        bcp = []
+    else:
+        outlet_dofs_Q = locate_dofs_topological(Q, fdim, outlet_facets)
+        bc_pressure = dirichletbc(PETSc.ScalarType(0.0), outlet_dofs_Q, Q)
+        bcp = [bc_pressure]
 
     bc_k_wall = dirichletbc(PETSc.ScalarType(k_spec.wall_value), wall_dofs_S_tb, S)
     bck = [bc_k_wall]
@@ -576,6 +590,60 @@ def solve_rans_kw(
                 f"(y_first mesh = {y_first:.6f}, requested = {y_first_cfg:.6f})",
                 flush=True,
             )
+
+    # ── Periodic BCs via dolfinx_mpc (channel only) ──────────────
+    if use_body_force:
+        if not HAVE_MPC:
+            raise RuntimeError(
+                "dolfinx_mpc is required for periodic channel flow. "
+                "Install with: conda install -c conda-forge dolfinx_mpc"
+            )
+        Lx = geom.Lx
+        _pbc_tol = 1e-6
+
+        def periodic_indicator(x):
+            """Identify slave DOFs on the right boundary."""
+            return np.isclose(x[0], Lx, atol=_pbc_tol)
+
+        def periodic_relation(x):
+            """Map right boundary coords to left boundary coords."""
+            out = x.copy()
+            out[0] -= Lx
+            return out
+
+        mpc_V = MultiPointConstraint(V)
+        mpc_V.create_periodic_constraint_geometrical(
+            V, periodic_indicator, periodic_relation, bcu, tol=_pbc_tol,
+        )
+        mpc_V.finalize()
+
+        mpc_Q = MultiPointConstraint(Q)
+        mpc_Q.create_periodic_constraint_geometrical(
+            Q, periodic_indicator, periodic_relation, bcp, tol=_pbc_tol,
+        )
+        mpc_Q.finalize()
+
+        mpc_S = MultiPointConstraint(S)
+        mpc_S.create_periodic_constraint_geometrical(
+            S, periodic_indicator, periodic_relation, bck + bcw, tol=_pbc_tol,
+        )
+        mpc_S.finalize()
+
+        if comm.rank == 0:
+            print(f"Periodic MPC: V={mpc_V.num_local_slaves} slaves, "
+                  f"Q={mpc_Q.num_local_slaves}, S={mpc_S.num_local_slaves}")
+
+        # Backsubstitute ICs so slave DOFs satisfy the periodic constraint
+        for fn in [u_n, u_n1, u_]:
+            mpc_V.backsubstitution(fn)
+        for fn in [k_n, k_, k_prev, omega_n, omega_, omega_prev]:
+            mpc_S.backsubstitution(fn)
+    else:
+        mpc_V = None
+        mpc_Q = None
+        mpc_S = None
+
+    if comm.rank == 0:
         print("Setting up weak forms...", flush=True)
 
     comm.barrier()  # Sync before form setup
@@ -594,8 +662,6 @@ def solve_rans_kw(
 
     a_k = form(lhs(F_k))
     L_k = form(rhs(F_k))
-    A_k = create_matrix(a_k)
-    b_k = create_vector(S)
 
     if comm.rank == 0:
         print("  k-equation forms ready", flush=True)
@@ -612,8 +678,6 @@ def solve_rans_kw(
 
     a_w = form(lhs(F_w))
     L_w = form(rhs(F_w))
-    A_w = create_matrix(a_w)
-    b_w = create_vector(S)
 
     if comm.rank == 0:
         print(f"  {model.scalar_name}-equation forms ready", flush=True)
@@ -637,26 +701,53 @@ def solve_rans_kw(
 
     a1 = form(lhs(F1_mom))
     L1 = form(rhs(F1_mom))
-    A1 = create_matrix(a1)
-    b1 = create_vector(V)
 
     if comm.rank == 0:
         print("  Momentum forms ready", flush=True)
 
     a2 = form(dot(grad(p), grad(q)) * dx)
     L2 = form(-rho_c / dt_c * div(u_s) * q * dx)
-    A2 = assemble_matrix(a2, bcs=bcp)
-    A2.assemble()
-    b2 = create_vector(Q)
-
-    if comm.rank == 0:
-        print("  Pressure forms ready", flush=True)
 
     a3 = form(rho_c * dot(u, v) * dx)
     L3 = form(rho_c * dot(u_s, v) * dx - dt_c * dot(nabla_grad(phi), v) * dx)
-    A3 = assemble_matrix(a3)
-    A3.assemble()
-    b3 = create_vector(V)
+
+    # ── Create matrices and vectors ──────────────────────────────
+    # MPC case: dolfinx_mpc creates matrices with extended sparsity
+    # pattern for the master-slave coupling; regular case uses dolfinx.
+    if mpc_V is not None:
+        A_k = mpc_assemble_matrix(a_k, mpc_S, bcs=bck)
+        b_k = mpc_assemble_vector(L_k, mpc_S)
+        A_w = mpc_assemble_matrix(a_w, mpc_S, bcs=bcw)
+        b_w = mpc_assemble_vector(L_w, mpc_S)
+        A1 = mpc_assemble_matrix(a1, mpc_V, bcs=bcu)
+        b1 = mpc_assemble_vector(L1, mpc_V)
+        A2 = mpc_assemble_matrix(a2, mpc_Q, bcs=bcp)
+        b2 = mpc_assemble_vector(L2, mpc_Q)
+        A3 = mpc_assemble_matrix(a3, mpc_V, bcs=[])
+        b3 = mpc_assemble_vector(L3, mpc_V)
+    else:
+        A_k = create_matrix(a_k)
+        b_k = create_vector(S)
+        A_w = create_matrix(a_w)
+        b_w = create_vector(S)
+        A1 = create_matrix(a1)
+        b1 = create_vector(V)
+        A2 = assemble_matrix(a2, bcs=bcp)
+        A2.assemble()
+        b2 = create_vector(Q)
+        A3 = assemble_matrix(a3)
+        A3.assemble()
+        b3 = create_vector(V)
+
+    # Pressure nullspace for periodic channel (no Dirichlet pin)
+    if use_body_force:
+        pressure_ns = PETSc.NullSpace().create(constant=True, comm=comm)
+        A2.setNullSpace(pressure_ns)
+    else:
+        pressure_ns = None
+
+    if comm.rank == 0:
+        print("  Pressure forms ready", flush=True)
 
     # Solvers (MPI-compatible preconditioners)
     solver_k = PETSc.KSP().create(comm)
@@ -698,23 +789,33 @@ def solve_rans_kw(
     if comm.rank == 0:
         print("  Linear solvers ready", flush=True)
 
-    def _reassemble_matrix(A, a, bcs):
-        A.zeroEntries()
-        assemble_matrix(A, a, bcs=bcs)
-        A.assemble()
+    def _reassemble_matrix(A, a, bcs, mpc=None):
+        if mpc is not None:
+            mpc_assemble_matrix(a, mpc, bcs=bcs, A=A)
+        else:
+            A.zeroEntries()
+            assemble_matrix(A, a, bcs=bcs)
+            A.assemble()
 
-    def _reassemble_vector(b, L, a, bcs):
-        with b.localForm() as loc:
-            loc.set(0.0)
-        assemble_vector(b, L)
-        apply_lifting(b, [a], [bcs])
+    def _reassemble_vector(b, L, a, bcs, mpc=None):
+        if mpc is not None:
+            mpc_assemble_vector(L, mpc, b=b)
+            mpc_apply_lifting(b, [a], [bcs], mpc)
+        else:
+            with b.localForm() as loc:
+                loc.set(0.0)
+            assemble_vector(b, L)
+            apply_lifting(b, [a], [bcs])
         b.ghostUpdate(addv=PETSc.InsertMode.ADD_VALUES, mode=PETSc.ScatterMode.REVERSE)
         set_bc(b, bcs)
 
-    def _reassemble_vector_no_bc(b, L):
-        with b.localForm() as loc:
-            loc.set(0.0)
-        assemble_vector(b, L)
+    def _reassemble_vector_no_bc(b, L, mpc=None):
+        if mpc is not None:
+            mpc_assemble_vector(L, mpc, b=b)
+        else:
+            with b.localForm() as loc:
+                loc.set(0.0)
+            assemble_vector(b, L)
         b.ghostUpdate(addv=PETSc.InsertMode.ADD_VALUES, mode=PETSc.ScatterMode.REVERSE)
 
     # Precompute wall shear stress forms (JIT compilation happens once here)
@@ -807,9 +908,6 @@ def solve_rans_kw(
         t += current_dt
         step += 1
 
-        if step == 1 and comm.rank == 0:
-            print("  Starting iteration 1...", flush=True)
-
         # Save old values for residual computation
         u_n_old[:] = u_n.x.array
         u_n_picard[:] = u_n.x.array
@@ -819,29 +917,33 @@ def solve_rans_kw(
 
         for picard_iter in range(solve.picard_max):
             # STEP 1: MOMENTUM (IPCS)
-            if step == 1 and picard_iter == 0 and comm.rank == 0:
-                print("    Solving momentum...", flush=True)
-            _reassemble_matrix(A1, a1, bcu)
-            _reassemble_vector(b1, L1, a1, bcu)
+            _reassemble_matrix(A1, a1, bcu, mpc=mpc_V)
+            _reassemble_vector(b1, L1, a1, bcu, mpc=mpc_V)
             solver1.solve(b1, u_s.x.petsc_vec)
             u_s.x.scatter_forward()
+            if mpc_V is not None:
+                mpc_V.backsubstitution(u_s)
 
             # STEP 2: PRESSURE CORRECTION
-            if step == 1 and picard_iter == 0 and comm.rank == 0:
-                print("    Solving pressure...", flush=True)
-            _reassemble_vector(b2, L2, a2, bcp)
+            _reassemble_vector(b2, L2, a2, bcp, mpc=mpc_Q)
+            if pressure_ns is not None:
+                pressure_ns.remove(b2)
             solver2.solve(b2, phi.x.petsc_vec)
             phi.x.scatter_forward()
+            if mpc_Q is not None:
+                mpc_Q.backsubstitution(phi)
+
             p_.x.petsc_vec.axpy(1.0, phi.x.petsc_vec)
             p_.x.scatter_forward()
+            if mpc_Q is not None:
+                mpc_Q.backsubstitution(p_)
 
             # STEP 3: VELOCITY CORRECTION
-            _reassemble_vector_no_bc(b3, L3)
+            _reassemble_vector_no_bc(b3, L3, mpc=mpc_V)
             solver3.solve(b3, u_.x.petsc_vec)
             u_.x.scatter_forward()
-
-            if step == 1 and picard_iter == 0 and comm.rank == 0:
-                print("    Velocity correction done", flush=True)
+            if mpc_V is not None:
+                mpc_V.backsubstitution(u_)
 
             # STEP 4: UPDATE u_n WITH UNDER-RELAXATION (Picard)
             u_n.x.array[:] = alpha_u * u_.x.array + (1.0 - alpha_u) * u_n_picard
@@ -855,24 +957,24 @@ def solve_rans_kw(
             )
 
             # STEP 5: k-equation
-            if step == 1 and picard_iter == 0 and comm.rank == 0:
-                print("    Solving k-equation...", flush=True)
-            _reassemble_matrix(A_k, a_k, bck)
-            _reassemble_vector(b_k, L_k, a_k, bck)
+            _reassemble_matrix(A_k, a_k, bck, mpc=mpc_S)
+            _reassemble_vector(b_k, L_k, a_k, bck, mpc=mpc_S)
             solver_k.solve(b_k, k_.x.petsc_vec)
             k_.x.scatter_forward()
+            if mpc_S is not None:
+                mpc_S.backsubstitution(k_)
 
             k_.x.array[:] = np.clip(k_.x.array, k_spec.clip_min, k_spec.clip_max)
             k_.x.array[:] = ur_kw * k_.x.array + (1.0 - ur_kw) * k_prev.x.array
             k_.x.scatter_forward()
 
             # STEP 6: scalar equation (ω or ε)
-            if step == 1 and picard_iter == 0 and comm.rank == 0:
-                print(f"    Solving {model.scalar_name}-equation...", flush=True)
-            _reassemble_matrix(A_w, a_w, bcw)
-            _reassemble_vector(b_w, L_w, a_w, bcw)
+            _reassemble_matrix(A_w, a_w, bcw, mpc=mpc_S)
+            _reassemble_vector(b_w, L_w, a_w, bcw, mpc=mpc_S)
             solver_w.solve(b_w, omega_.x.petsc_vec)
             omega_.x.scatter_forward()
+            if mpc_S is not None:
+                mpc_S.backsubstitution(omega_)
 
             omega_.x.array[:] = np.clip(omega_.x.array, scalar_spec.clip_min, scalar_spec.clip_max)
             omega_.x.array[:] = ur_kw * omega_.x.array + (1.0 - ur_kw) * omega_prev.x.array
