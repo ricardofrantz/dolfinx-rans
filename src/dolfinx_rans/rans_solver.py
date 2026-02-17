@@ -602,7 +602,7 @@ def solve_rans_kw(
 
     # Scalar equation: dφ/dt + u·∇φ = ∇·((ν + σ_φ·ν_t)∇φ) + P_φ - R_φ·φ + CD
     F_w = (
-        (w_trial - omega_prev) / dt_c * phi_w * dx
+        (w_trial - omega_n) / dt_c * phi_w * dx
         + dot(u_n, grad(w_trial)) * phi_w * dx
         + (nu_c + c.sigma_phi * c.nu_t_diff_phi) * inner(grad(w_trial), grad(phi_w)) * dx
         + c.reaction_phi * w_trial * phi_w * dx
@@ -1024,6 +1024,8 @@ def solve_rans_kw(
         dt_candidate = current_dt
         if ema_ratio < solve.dt_growth_threshold:
             dt_candidate *= solve.dt_growth
+        elif ema_ratio > 1.05:
+            dt_candidate *= 0.5
 
         current_dt = min(dt_candidate, dt_cfl, solve.dt_max)
         if solve.min_dt_ratio > 0.0:

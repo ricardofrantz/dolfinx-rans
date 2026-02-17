@@ -1,0 +1,20 @@
+{
+  "config_path": "channel/channel.jsonc",
+  "cwd": "/home/rfrantz/dolfinx-rans",
+  "dolfinx_rans_version": "0.1.0",
+  "git": {
+    "dirty": "1",
+    "root": "/home/rfrantz/dolfinx-rans",
+    "sha": "e23bdbef0198d2d6ca7eafd493185edd40a5f82a"
+  },
+  "platform": {
+    "machine": "x86_64",
+    "release": "6.18.7-76061807-generic",
+    "system": "Linux"
+  },
+  "python": {
+    "executable": "/home/rfrantz/miniforge3/envs/fenicsx/bin/python3",
+    "version": "3.11.14 | packaged by conda-forge | (main, Jan 26 2026, 23:48:32) [GCC 14.3.0]"
+  },
+  "timestamp_utc": "2026-02-17T10:20:47.844722+00:00"
+}
