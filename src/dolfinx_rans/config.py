@@ -1,56 +1,21 @@
 """
-Configuration dataclasses and turbulence model constants for dolfinx-rans.
+Configuration dataclasses for dolfinx-rans.
 
 Contains:
-- k-omega model constants (Wilcox 2006, SST Menter 1994)
+- Shared turbulence constants (BETA_0, KAPPA) used by geometry.py
 - Geometry dataclasses (ChannelGeom, BFSGeom)
 - Flow/turbulence/solver parameter dataclasses
 - BoundaryInfo container for tagged facet arrays
+
+Model-specific constants live in dolfinx_rans/models/*.py.
 """
 
 from dataclasses import dataclass
 
-import numpy as np
 
-
-# =============================================================================
-# k-omega model constants (Wilcox 2006)
-# Reference: Wilcox, D.C. "Turbulence Modeling for CFD", 3rd ed., DCW Industries, 2006
-# =============================================================================
-
-BETA_STAR = 0.09  # k destruction coefficient
-BETA_0 = 0.0708  # Base omega destruction coefficient (was 0.075 in 1998)
-SIGMA_K = 0.6  # k diffusion Prandtl number (was 0.5 in 1998)
-SIGMA_W = 0.5  # omega diffusion Prandtl number
+# Shared turbulence constants used by geometry.py (omega wall IC, log law)
+BETA_0 = 0.0708  # Base omega destruction coefficient (Wilcox 2006)
 KAPPA = 0.41  # von Karman constant
-# gamma chosen to yield correct log-layer: gamma = beta_0/beta* - sigma_w*kappa^2/sqrt(beta*)
-GAMMA = BETA_0 / BETA_STAR - SIGMA_W * KAPPA**2 / np.sqrt(BETA_STAR)  # ~ 0.52
-
-# Wilcox 2006 additions
-SIGMA_D0 = 0.125  # Cross-diffusion coefficient (1/8)
-C_LIM = 0.875  # Stress limiter constant (7/8)
-SQRT_BETA_STAR = np.sqrt(BETA_STAR)
-
-# =============================================================================
-# k-omega SST Model Constants (Menter 1994)
-# Reference: Menter, F.R. "Two-equation eddy-viscosity turbulence models
-#            for engineering applications." AIAA Journal, 32(8), 1994.
-# =============================================================================
-
-# Inner layer (k-omega) constants - subscript 1
-SST_SIGMA_K1 = 0.85
-SST_SIGMA_W1 = 0.5
-SST_BETA1 = 0.075
-SST_GAMMA1 = SST_BETA1 / BETA_STAR - SST_SIGMA_W1 * KAPPA**2 / np.sqrt(BETA_STAR)
-
-# Outer layer (k-epsilon transformed) constants - subscript 2
-SST_SIGMA_K2 = 1.0
-SST_SIGMA_W2 = 0.856
-SST_BETA2 = 0.0828
-SST_GAMMA2 = SST_BETA2 / BETA_STAR - SST_SIGMA_W2 * KAPPA**2 / np.sqrt(BETA_STAR)
-
-# SST limiter constant
-SST_A1 = 0.31
 
 
 # =============================================================================
@@ -137,7 +102,16 @@ class TurbParams:
     k_min: float
     k_max: float
     C_lim: float
-    model: str = "wilcox2006"  # "wilcox2006" or "sst"
+    # Supported models: "wilcox2006", "sst", "kepsilon"
+    model: str = "wilcox2006"
+    C_mu: float = 0.09  # Kepsilon C_mu constant
+    sigma_k_kepsilon: float = 1.0  # ε-model diffusion coefficient sigma_k
+    sigma_epsilon: float = 1.3  # ε-model diffusion coefficient sigma_ε
+    C_epsilon_1: float = 1.44  # Kepsilon C1 constant
+    C_epsilon_2: float = 1.92  # Kepsilon C2 constant
+    epsilon_min: float = 1e-16  # ε floor
+    epsilon_max: float = 1e8  # ε upper guard
+    f_nu_min: float = 0.01116225  # Lam-Bremhorst f_nu lower floor
 
 
 @dataclass(frozen=True)

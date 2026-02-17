@@ -18,69 +18,6 @@ CONDA_ENV="fenicsx"
 DEFAULT_CASE_DIR="$SCRIPT_DIR/channel"
 DEFAULT_CONFIG="$DEFAULT_CASE_DIR/channel.jsonc"
 
-write_default_channel_config() {
-    mkdir -p "$DEFAULT_CASE_DIR"
-    cat > "$DEFAULT_CONFIG" <<'JSON'
-{
-  "_meta": { // metadata
-    "purpose": "Canonical channel benchmark",
-    "reference": "Nek poiseuille_RANS benchmark parity for Re_τ=1115.8187",
-    "notes": "Keep only channel/channel.jsonc and clear channel/results to rerun."
-  },
-  "geom": {
-    "Lx": 1.0, // domain length
-    "Ly": 2.0, // full channel height
-    "Nx": 192, // streamwise cells
-    "Ny": 166, // wall-normal cells
-    "mesh_type": "quad",
-    "y_first": 0.001604628, // first wall-normal spacing
-    "growth_rate": 1.0, // wall-cell growth ratio
-    "stretching": "tanh", // spacing profile
-    "y_first_tol_rel": 0.2, // y_first verification tolerance
-    "use_symmetry": false // full-height channel
-  },
-  "nondim": {
-    "Re_tau": 1115.818661288065, // target friction Reynolds number
-    "use_body_force": true // drive flow with body force
-  },
-  "turb": {
-    "model": "wilcox2006", // turbulence model
-    "beta_star": 0.09, // Wilcox standard constant
-    "nu_t_max_factor": 2000.0, // nu_t/nu cap
-    "omega_min": 1.0, // omega floor
-    "k_min": 1e-10, // k floor
-    "k_max": 20.0, // k cap
-    "C_lim": 0.0 // disable Durbin limiter
-  },
-  "solve": {
-    "dt": 0.005, // legacy-style initial step (CFL will cap initially)
-    "dt_max": 0.01, // max pseudo-time step
-    "dt_growth": 1.05, // dt multiplier on convergence
-    "dt_growth_threshold": 0.8, // residual-ratio threshold to grow dt
-    "cfl_target": 0.25, // mapped from legacy CFL_RELAXATION
-    "t_final": 10000.0, // pseudo-time cap
-    "max_iter": 3000, // max outer iterations
-    "steady_tol": 1e-6, // residual tolerance
-    "enable_physical_convergence": false, // skip physical convergence gate
-    "physical_u_bulk_rel_tol": 1e-4, // bulk-velocity tolerance
-    "physical_tau_wall_rel_tol": 2.5e-3, // wall-shear tolerance
-    "physical_convergence_start_iter": 10, // gate start iteration
-    "picard_max": 6, // Picard inner iterations
-    "picard_tol": 1e-4, // Picard tolerance
-    "under_relax_k_omega": 0.6, // k and omega under-relax
-    "under_relax_nu_t": 0.4, // nu_t under-relax
-    "log_interval": 10, // print interval
-    "snapshot_interval": 50, // VTX output interval
-    "out_dir": "results", // results folder under case dir
-    "min_iter": 50 // minimum iterations before convergence
-  },
-  "benchmark": {
-    "reference_profile_csv": "" // optional Nek reference CSV
-  }
-}
-JSON
-}
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Activate conda environment
 # ─────────────────────────────────────────────────────────────────────────────
@@ -132,7 +69,6 @@ fi
 # Select config file
 case "$CONFIG_ARG" in
     channel|canonical|default)
-        write_default_channel_config
         CONFIG="$DEFAULT_CONFIG"
         echo "Running: canonical channel case"
         ;;
@@ -165,9 +101,9 @@ echo "────────────────────────�
 echo "Running pre-flight checks..."
 
 # 1. Syntax check
-if ! python -m py_compile "$SCRIPT_DIR/src/dolfinx_rans/solver.py" 2>/dev/null; then
-    echo "ERROR: Python syntax error in solver.py"
-    python -m py_compile "$SCRIPT_DIR/src/dolfinx_rans/solver.py"
+if ! python -m py_compile "$SCRIPT_DIR/src/dolfinx_rans/rans_solver.py" 2>/dev/null; then
+    echo "ERROR: Python syntax error in rans_solver.py"
+    python -m py_compile "$SCRIPT_DIR/src/dolfinx_rans/rans_solver.py"
     exit 1
 fi
 

@@ -25,7 +25,7 @@ from dolfinx_rans.config import (
     TurbParams,
 )
 from dolfinx_rans.geometry import create_bfs_mesh, create_channel_mesh
-from dolfinx_rans.solver import solve_rans_kw
+from dolfinx_rans.rans_solver import solve_rans_kw
 
 __all__ = [
     "__version__",

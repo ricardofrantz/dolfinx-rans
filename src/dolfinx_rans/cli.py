@@ -24,7 +24,7 @@ from dolfinx_rans.geometry import (
     create_channel_mesh,
     mark_bfs_boundaries,
 )
-from dolfinx_rans.solver import solve_rans_kw
+from dolfinx_rans.rans_solver import solve_rans_kw
 from dolfinx_rans.utils import (
     compute_bulk_velocity,
     compute_reattachment_length,
@@ -123,7 +123,7 @@ def _run_channel(cfg, cfg_path, args, turb, solve_params):
 
     if MPI.COMM_WORLD.rank == 0:
         print("=" * 60)
-        print("RANS k-ω CHANNEL FLOW - dolfinx-rans")
+        print(f"RANS CHANNEL FLOW ({turb.model}) - dolfinx-rans")
         print("=" * 60)
         print(f"Mode: NONDIMENSIONAL (Re_τ = {Re_tau})")
         print(f"Scaling: δ = 1, u_τ = 1, ν* = 1/Re_τ = {1.0/Re_tau:.6f}")
@@ -191,7 +191,7 @@ def _run_bfs(cfg, cfg_path, args, turb, solve_params):
 
     if MPI.COMM_WORLD.rank == 0:
         print("=" * 60)
-        print("RANS k-ω BACKWARD-FACING STEP - dolfinx-rans")
+        print(f"RANS BACKWARD-FACING STEP ({turb.model}) - dolfinx-rans")
         print("=" * 60)
         print(f"Re_τ = {nondim.Re_tau}")
         print(f"Step height h = {h}, ER = {ER}")
