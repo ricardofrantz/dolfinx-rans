@@ -122,17 +122,35 @@ cd dolfinx-rans && uv pip install -e .
 # 3. Run canonical case (Re = 100,000 channel flow)
 ./run_channel.sh
 
-# Results appear in channel/:
-#   final_fields.png  — Contour plots and profiles
-#   history.csv       — Convergence history
-#   profiles.csv      — Wall-normal benchmark profile
+# Results appear in channel/results/:
+#   final_fields.png          — Final field/profile composite
+#   fields0000000.png         — Channel snapshot at logged iterations
+#   convergence.png           — Live residual and dt history
+#   history.csv               — Per-iteration residual/metrics log
+#   profiles.csv              — Wall-normal benchmark profile
+#
+# For BFS case outputs and one canonical file only:
+#   ./run_bfs.sh
+#   bfs/results/
+#   bfs_fields0000000.png     — BFS field snapshots (iteration tagged)
+#   bfs_cf0000000.png        — BFS wall-friction snapshots (iteration tagged)
+#   bfs_profiles0000000.png   — BFS profile snapshots (iteration tagged)
 ```
 
 The runner supports MPI parallelism:
 
 ```bash
 ./run_channel.sh 4                      # 4 MPI processes
-./run_channel.sh 8 path/to/config.json  # 8 processes, custom config
+./run_channel.sh 8 path/to/config.jsonc # 8 processes, custom config
+```
+
+Case layout is intentionally strict:
+- `channel/channel.jsonc` and `bfs/bfs.jsonc` are the working canonical configs
+- `channel/results/` and `bfs/results/` are the only case outputs
+
+Clean outputs before a fresh rerun:
+```bash
+rm -rf channel/results bfs/results
 ```
 
 ```
@@ -267,58 +285,64 @@ MPC modifies the stiffness matrix to enforce $u_\text{right} = u_\text{left}$ as
 
 A single JSON file controls the entire simulation. Core sections (`geom`, `nondim`, `turb`, `solve`) are required. The `benchmark` section is optional and enables regression gates. Keys starting with `_` are ignored, allowing JSON comments.
 
-**Full example** (the canonical Re = 100,000 case):
+**Full example** (the canonical channel case, `channel/channel.jsonc`):
 
-```json
+```jsonc
 {
   "_meta": {
-    "purpose": "Canonical single-case run config",
-    "reference": "Nek poiseuille_RANS uses Re=100000 via viscosity=-1e5 in .par"
+    "purpose": "Canonical channel benchmark", // single production case
+    "reference": "Nek poiseuille_RANS benchmark parity for Re_τ=1115.8187", // reference target
+    "notes": "Keep only this file in channel/ and clear channel/results to rerun." // workflow note
   },
   "geom": {
-    "Lx": 1.0,
-    "Ly": 2.0,
-    "Nx": 192,
-    "Ny": 166,
-    "mesh_type": "quad",
-    "y_first": 0.001604628,
-    "growth_rate": 1.0,
-    "stretching": "tanh",
-    "y_first_tol_rel": 0.2,
-    "use_symmetry": false
+    "Lx": 1.0, // domain length
+    "Ly": 2.0, // full-channel height
+    "Nx": 192, // streamwise cells
+    "Ny": 166, // wall-normal cells
+    "mesh_type": "quad", // element family
+    "y_first": 0.001604628, // first wall-normal spacing
+    "growth_rate": 1.0, // wall-growth ratio
+    "stretching": "tanh", // spacing profile
+    "y_first_tol_rel": 0.2, // y_first consistency tolerance
+    "use_symmetry": false // full-height channel
   },
   "nondim": {
-    "Re_tau": 1115.818661288065,
-    "use_body_force": true
+    "Re_tau": 1115.818661288065, // target friction Reynolds
+    "use_body_force": true // body-force-driven channel
   },
   "turb": {
-    "model": "wilcox2006",
-    "beta_star": 0.09,
-    "nu_t_max_factor": 2000.0,
-    "omega_min": 1.0,
-    "k_min": 1e-10,
-    "k_max": 20.0,
-    "C_lim": 0.0
+    "model": "wilcox2006", // two-equation model
+    "beta_star": 0.09, // Wilcox model constant
+    "nu_t_max_factor": 2000.0, // ν_t limiter
+    "omega_min": 1.0, // ω floor
+    "k_min": 1e-10, // k floor
+    "k_max": 20.0, // k cap
+    "C_lim": 0.0 // Durbin limiter disabled
   },
   "solve": {
-    "dt": 0.0002,
-    "dt_max": 0.01,
-    "dt_growth": 1.05,
-    "dt_growth_threshold": 0.8,
-    "t_final": 10000.0,
-    "max_iter": 1200,
-    "steady_tol": 1e-3,
-    "enable_physical_convergence": false,
-    "picard_max": 6,
-    "picard_tol": 1e-4,
-    "under_relax_k_omega": 0.6,
-    "under_relax_nu_t": 0.4,
-    "log_interval": 10,
-    "snapshot_interval": 50,
-    "out_dir": "results"
+    "dt": 0.005, // initial pseudo-time step
+    "dt_max": 0.01, // pseudo-time step cap
+    "dt_growth": 1.05, // dt growth factor on good convergence
+    "dt_growth_threshold": 0.8, // residual threshold to grow dt
+    "cfl_target": 0.25, // mapped from legacy stability target
+    "t_final": 10000.0, // outer-loop safety time cap
+    "max_iter": 3000, // outer-iteration cap
+    "steady_tol": 1e-6, // residual tolerance
+    "enable_physical_convergence": false, // keep residual-based convergence
+    "physical_u_bulk_rel_tol": 1e-4, // physical gate (unused unless enabled)
+    "physical_tau_wall_rel_tol": 2.5e-3, // physical gate (unused unless enabled)
+    "physical_convergence_start_iter": 10, // gate start iteration
+    "picard_max": 6, // inner nonlinear sweep count
+    "picard_tol": 1e-4, // inner nonlinear stopping
+    "under_relax_k_omega": 0.6, // k/ω under-relaxation
+    "under_relax_nu_t": 0.4, // ν_t under-relaxation
+    "log_interval": 10, // print + log every N iters
+    "snapshot_interval": 50, // numbered PNG + VTX intervals
+    "out_dir": "results", // writes into case/results
+    "min_iter": 50 // block early convergence
   },
   "benchmark": {
-    "reference_profile_csv": ""
+    "reference_profile_csv": "" // optional benchmark overlay CSV
   }
 }
 ```
@@ -389,6 +413,8 @@ With y_first = 1.60e-3 and tanh stretching:
 | `log_interval` | int | Print diagnostics every N iterations | |
 | `snapshot_interval` | int | Save VTX + PNG every N iterations (0 = disabled) | |
 | `out_dir` | str | Output directory for results | |
+| `min_iter` | int | Minimum iterations before accepting steady convergence | |
+| `min_dt_ratio` | float | Convergence is blocked until `dt >= min_dt_ratio * dt_initial` | |
 
 **Decision:** Under-relaxation factors of 0.6 (k, ω) and 0.4 (ν_t) were determined empirically. Higher values cause oscillation in the ν_t feedback loop; lower values converge but take more iterations. The ν_t under-relaxation is more aggressive than k/ω because ν_t amplifies small changes through the momentum equation.
 
@@ -778,10 +804,13 @@ dolfinx-rans/
 │   └── validation/
 │       └── nek_poiseuille_profile.py  — Nek5000 profile extraction and comparison
 ├── bfs/
-│   ├── bfs.jsonc         — BFS canonical case (JSONC with inline comments)
-│   └── ...
+│   ├── bfs.jsonc         — Canonical BFS case (single config file)
+│   ├── run.file           — Human-readable run transcript
+│   └── results/           — BFS outputs (plots, history, snapshots, etc.)
 ├── channel/
-│   └── channel.jsonc   — Canonical case configuration
+│   ├── channel.jsonc      — Canonical channel case configuration
+│   ├── run.file           — Human-readable run transcript
+│   └── results/           — Channel outputs (plots, history, snapshots, ...)
 ├── run_channel.sh         — One-command runner for channel case
 ├── run_bfs.sh             — One-command runner for BFS case
 └── pyproject.toml         — Package metadata (hatchling build system)
@@ -929,13 +958,15 @@ turb = TurbParams(
 
 # Solver settings
 solve = SolveParams(
-    dt=0.0002, dt_max=0.01, dt_growth=1.05,
-    dt_growth_threshold=0.8, t_final=10000.0,
-    max_iter=1200, steady_tol=1e-3,
+    dt=0.005, dt_max=0.01, dt_growth=1.05,
+    dt_growth_threshold=0.8, cfl_target=0.25,
+    t_final=10000.0, max_iter=3000, steady_tol=1e-6,
+    enable_physical_convergence=False, physical_u_bulk_rel_tol=1e-4,
+    physical_tau_wall_rel_tol=2.5e-3, physical_convergence_start_iter=10,
     picard_max=6, picard_tol=1e-4,
     under_relax_k_omega=0.6, under_relax_nu_t=0.4,
-    log_interval=10, snapshot_interval=50,
-    out_dir="results",
+    log_interval=10, snapshot_interval=50, out_dir="results",
+    min_iter=50,
 )
 
 # Create mesh and run
@@ -948,15 +979,15 @@ u, p, k, omega, nu_t, V, Q, S, domain, step, t = solve_rans_kw(
 The solver can also be run from the command line:
 
 ```bash
-dolfinx-rans config.json           # Serial
-mpirun -np 4 dolfinx-rans config.json  # Parallel
+dolfinx-rans channel/channel.jsonc  # Serial
+mpirun -np 4 dolfinx-rans channel/channel.jsonc  # Parallel
 ```
 
 ---
 
 ## Output Files
 
-Results are saved to the directory specified by `solve.out_dir`:
+Results are saved to the case `results/` directory specified by `solve.out_dir` (defaults to `"results"` in repo configs):
 
 | File | Description |
 |------|-------------|
@@ -968,8 +999,10 @@ Results are saved to the directory specified by `solve.out_dir`:
 | `config_used.json` | Exact config snapshot for reproducibility |
 | `run_info.json` | Environment metadata (Python version, git SHA, timestamp) |
 | `snps/*.bp` | VTX time series for ParaView (ADIOS2 format, if `snapshot_interval > 0`) |
-| `fields.png` | Latest live field snapshot (overwritten each snapshot interval) |
-| `fields_NNNNN.png` | Numbered field snapshots (preserved for animation) |
+| `fields0000000.png` | Channel iteration field snapshots (numbered) |
+| `bfs_fields0000000.png` | BFS iteration field snapshots (numbered) |
+| `bfs_cf0000000.png` | BFS wall friction snapshots (numbered) |
+| `bfs_profiles0000000.png` | BFS profiles snapshots (numbered) |
 
 ---
 

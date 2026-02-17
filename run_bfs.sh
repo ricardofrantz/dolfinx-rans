@@ -4,8 +4,8 @@
 # Usage:
 #   ./run_bfs.sh                           # Serial, default BFS config
 #   ./run_bfs.sh 8                         # 8 MPI processes, default BFS config
-#   ./run_bfs.sh path/to/config.json        # Serial, custom config
-#   ./run_bfs.sh 4 path/to/config.json      # 4 MPI processes, custom config
+#   ./run_bfs.sh path/to/config.jsonc        # Serial, custom config
+#   ./run_bfs.sh 4 path/to/config.jsonc      # 4 MPI processes, custom config
 
 set -e  # Exit on error
 

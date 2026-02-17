@@ -54,6 +54,6 @@
     "snapshot_interval": 200, // VTX + field plot interval
     "out_dir": "results", // writes to case/results
     "min_iter": 200, // prevent premature convergence
-    "min_dt_ratio": 0.001 // floor dt at 0.1% of initial dt
+    "min_dt_ratio": 0.05 // floor dt at 5% of initial dt
   }
 }

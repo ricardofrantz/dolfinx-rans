@@ -49,7 +49,8 @@
     "log_interval": 10, // diagnostic print interval
     "snapshot_interval": 50, // VTX snapshot interval
     "out_dir": "results", // writes to case/results
-    "min_iter": 50 // minimum iterations before convergence
+    "min_iter": 50, // minimum iterations before convergence
+    "min_dt_ratio": 0.05 // reject convergence if dt < 5% of initial
   },
   "benchmark": {
     "reference_profile_csv": "" // optional benchmark profile
