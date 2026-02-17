@@ -120,9 +120,9 @@ conda activate fenicsx
 cd dolfinx-rans && uv pip install -e .
 
 # 3. Run canonical case (Re = 100,000 channel flow)
-./run_re100k.sh
+./run_channel.sh
 
-# Results appear in re100k/results/:
+# Results appear in channel/:
 #   final_fields.png  — Contour plots and profiles
 #   history.csv       — Convergence history
 #   profiles.csv      — Wall-normal benchmark profile
@@ -131,8 +131,8 @@ cd dolfinx-rans && uv pip install -e .
 The runner supports MPI parallelism:
 
 ```bash
-./run_re100k.sh 4                      # 4 MPI processes
-./run_re100k.sh 8 path/to/config.json  # 8 processes, custom config
+./run_channel.sh 4                      # 4 MPI processes
+./run_channel.sh 8 path/to/config.json  # 8 processes, custom config
 ```
 
 ```
@@ -315,7 +315,7 @@ A single JSON file controls the entire simulation. Core sections (`geom`, `nondi
     "under_relax_nu_t": 0.4,
     "log_interval": 10,
     "snapshot_interval": 50,
-    "out_dir": "re100k/results"
+    "out_dir": "channel"
   },
   "benchmark": {
     "reference_profile_csv": ""
@@ -777,9 +777,13 @@ dolfinx-rans/
 │   ├── plotting.py    — Mesh, field, convergence, and profile plots
 │   └── validation/
 │       └── nek_poiseuille_profile.py  — Nek5000 profile extraction and comparison
-├── re100k/
+├── bfs/
+│   ├── bfs_quick.json   — BFS quick debug case
+│   └── ...
+├── channel/
 │   └── run_config.json   — Canonical case configuration
-├── run_re100k.sh          — One-command runner with pre-flight checks
+├── run_channel.sh         — One-command runner for channel case
+├── run_bfs.sh             — One-command runner for BFS quick case
 └── pyproject.toml         — Package metadata (hatchling build system)
 ```
 
@@ -841,22 +845,22 @@ The canonical validation case matches the [Nek5000 RANS tutorial](https://nek500
 
 ### Comparison Workflow
 
-1. **Run dolfinx-rans:** `./run_re100k.sh` → produces `re100k/results/profiles.csv`
+1. **Run dolfinx-rans:** `./run_channel.sh` → produces `channel/profiles.csv`
 2. **Extract Nek5000 profile:**
    ```bash
    python -m dolfinx_rans.validation.nek_poiseuille_profile \
        --nek-case-dir path/to/poiseuille_RANS \
        --out-dir nek_re100k \
-       --dolfinx-profiles re100k/results/profiles.csv
+       --dolfinx-profiles channel/profiles.csv
    ```
 3. **Configure regression gate:** Set `benchmark.reference_profile_csv` to the Nek reference CSV
-4. **Re-run with gate:** `./run_re100k.sh` — the post-run check compares profiles automatically
+4. **Re-run with gate:** `./run_channel.sh` — the post-run check compares profiles automatically
 
 The comparison uses outer scaling ($U/U_\text{bulk}$ vs $y/\delta$) because it is independent of the wall-friction estimate and provides a shape comparison of the mean velocity profile.
 
 ### Regression Gates
 
-The `run_re100k.sh` script includes post-run regression checks driven by the `benchmark` config section:
+The `run_channel.sh` script includes post-run regression checks driven by the `benchmark` config section:
 
 - **Bulk velocity gate:** $U_\text{bulk}$ must fall within `gate_u_bulk_bounds`
 - **Wall shear gate:** $\tau_\text{wall}$ must fall within `gate_tau_wall_bounds`

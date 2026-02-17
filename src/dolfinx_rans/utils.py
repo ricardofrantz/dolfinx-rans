@@ -68,8 +68,10 @@ def print_dc_json(obj: Any) -> None:
 @dataclasses.dataclass(frozen=True)
 class CasePaths:
     case_dir: Path
+    results_dir: Path
     snps_dir: Path
     history_csv: Path
+    run_file: Path
     run_info_json: Path
     config_used_json: Path
 
@@ -113,17 +115,21 @@ def prepare_case_dir(
 
     Creates:
       - <out_dir>/config_used.json
-      - <out_dir>/run_info.json
-      - <out_dir>/<snps_subdir>/
+      - <out_dir>/run.file
+      - <out_dir>/run_info.json (compat alias)
+      - <out_dir>/results/<snps_subdir>/
     """
     case_dir = Path(out_dir)
     case_dir.mkdir(parents=True, exist_ok=True)
-    snps_dir = case_dir / snps_subdir
+    results_dir = case_dir / "results"
+    results_dir.mkdir(parents=True, exist_ok=True)
+    snps_dir = results_dir / snps_subdir
     snps_dir.mkdir(parents=True, exist_ok=True)
 
     config_used_json = case_dir / "config_used.json"
+    run_file = case_dir / "run.file"
     run_info_json = case_dir / "run_info.json"
-    history_csv = case_dir / "history.csv"
+    history_csv = results_dir / "history.csv"
 
     write_json(config_used_json, dict(cfg))
 
@@ -143,12 +149,16 @@ def prepare_case_dir(
     if git:
         info["git"] = git
 
+    write_json(run_file, info)
+    # Backward-compatible metadata filename retained for scripts expecting JSON suffix.
     write_json(run_info_json, info)
 
     return CasePaths(
         case_dir=case_dir,
+        results_dir=results_dir,
         snps_dir=snps_dir,
         history_csv=history_csv,
+        run_file=run_file,
         run_info_json=run_info_json,
         config_used_json=config_used_json,
     )

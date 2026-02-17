@@ -100,10 +100,11 @@ def _run_channel(cfg, cfg_path, args, turb, solve_params):
         print_dc_json(nondim)
         return 0
 
-    results_dir = Path(solve_params.out_dir)
+    case_dir = Path(solve_params.out_dir)
     if MPI.COMM_WORLD.rank == 0:
-        prepare_case_dir(results_dir, config_path=cfg_path, cfg=cfg, snps_subdir="snps")
+        prepare_case_dir(case_dir, config_path=cfg_path, cfg=cfg, snps_subdir="snps")
     MPI.COMM_WORLD.barrier()
+    results_dir = case_dir / "results"
 
     if MPI.COMM_WORLD.rank == 0:
         print("=" * 60)
@@ -163,10 +164,11 @@ def _run_bfs(cfg, cfg_path, args, turb, solve_params):
         print_dc_json(nondim)
         return 0
 
-    results_dir = Path(solve_params.out_dir)
+    case_dir = Path(solve_params.out_dir)
     if MPI.COMM_WORLD.rank == 0:
-        prepare_case_dir(results_dir, config_path=cfg_path, cfg=cfg, snps_subdir="snps")
+        prepare_case_dir(case_dir, config_path=cfg_path, cfg=cfg, snps_subdir="snps")
     MPI.COMM_WORLD.barrier()
+    results_dir = case_dir / "results"
 
     h = geom.step_height
     ER = geom.expansion_ratio
@@ -197,8 +199,9 @@ def _run_bfs(cfg, cfg_path, args, turb, solve_params):
     nu = 1.0 / nondim.Re_tau
 
     # 2D contour fields
+    final_step_tag = f"{step:07d}"
     plot_bfs_fields(u, p, k, omega, nu_t, domain, geom, nu,
-                    save_path=results_dir / "bfs_fields.png")
+                    save_path=results_dir / f"bfs_fields{final_step_tag}.png")
 
     # Reattachment length (all ranks must participate)
     x_r = compute_reattachment_length(u, domain, nu, x_step=0.0, y_wall=0.0)
@@ -206,11 +209,11 @@ def _run_bfs(cfg, cfg_path, args, turb, solve_params):
         print(f"  Reattachment length: x_r = {x_r:.3f}, x_r/h = {x_r/h:.2f}")
 
     # Skin friction along bottom wall
-    plot_bfs_cf(u, domain, geom, nu, x_r=x_r, save_path=results_dir / "bfs_cf.png")
+    plot_bfs_cf(u, domain, geom, nu, x_r=x_r, save_path=results_dir / f"bfs_cf{final_step_tag}.png")
 
     # Vertical profiles at downstream stations
     plot_bfs_profiles(u, k, nu_t, domain, geom, nu,
-                      save_path=results_dir / "bfs_profiles.png")
+                      save_path=results_dir / f"bfs_profiles{final_step_tag}.png")
 
     # CSV export
     write_bfs_profile_csv(u, k, omega, nu_t, domain, geom, nu,

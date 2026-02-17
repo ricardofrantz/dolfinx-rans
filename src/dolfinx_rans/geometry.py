@@ -644,9 +644,36 @@ def create_bfs_mesh(geom: BFSGeom):
             f"to mesh the step region [0, h]"
         )
 
-    # 1D coordinate arrays (uniform spacing)
+    # 1D coordinate arrays
     x_up = np.linspace(-L_up, 0.0, Nx_up + 1)
-    x_down = np.linspace(0.0, L_down, Nx_down + 1)
+
+    # Downstream: uniform up to x_stretch, then geometric growth beyond.
+    # dx starts at the uniform value and grows by growth_rate per cell.
+    # Nx_coarse is determined by how many cells fit before reaching L_down.
+    x_stretch = 10.0 * h  # start coarsening after recirculation zone
+    if x_stretch < L_down and geom.growth_rate > 1.0:
+        dx_fine = L_down / Nx_down  # uniform cell size (baseline)
+        Nx_fine = int(round(x_stretch / dx_fine))
+        Nx_fine = max(Nx_fine, 1)
+        x_fine = np.linspace(0.0, Nx_fine * dx_fine, Nx_fine + 1)
+        # Coarse zone: grow from dx_fine, figure out how many cells fill the rest
+        L_coarse = L_down - x_fine[-1]
+        r = geom.growth_rate
+        x_coarse = [x_fine[-1]]
+        dx = dx_fine
+        while x_coarse[-1] < L_down - 1e-12:
+            dx *= r
+            x_coarse.append(x_coarse[-1] + dx)
+        x_coarse[-1] = L_down  # exact endpoint
+        x_coarse = np.array(x_coarse)
+        Nx_coarse = len(x_coarse) - 1
+        x_down = np.concatenate([x_fine[:-1], x_coarse])
+        if comm.rank == 0:
+            print(f"  x-mesh: {Nx_fine} uniform (dx={dx_fine:.4f}) + "
+                  f"{Nx_coarse} stretched (dx={dx_fine*r:.4f}→{dx*r:.4f})")
+    else:
+        x_down = np.linspace(0.0, L_down, Nx_down + 1)
+
     x_all = np.concatenate([x_up[:-1], x_down])  # unique x values
 
     y_low = np.linspace(0.0, h, Ny_step + 1)

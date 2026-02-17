@@ -152,6 +152,7 @@ class SolveParams:
     t_final: Max pseudo-time (safety limit, usually not reached)
     max_iter: Max iterations before giving up
     steady_tol: Convergence tolerance on velocity residual
+    cfl_target: Global target CFL (cfl = u_max*dt/h_min), defaults to 1.0 when omitted
     enable_physical_convergence: Also require physical metric changes to settle
     physical_u_bulk_rel_tol: Relative tolerance for successive U_bulk changes
     physical_tau_wall_rel_tol: Relative tolerance for successive tau_wall changes
@@ -163,6 +164,8 @@ class SolveParams:
     log_interval: Print every N iterations
     snapshot_interval: Save VTX every N iterations (0 = disabled)
     out_dir: Output directory for results
+    min_iter: Minimum outer iterations before steady convergence check
+    min_dt_ratio: Minimum dt ratio to initial dt required to accept convergence
     """
 
     dt: float
@@ -179,10 +182,13 @@ class SolveParams:
     log_interval: int
     snapshot_interval: int
     out_dir: str
+    cfl_target: float = 1.0
     enable_physical_convergence: bool = False
     physical_u_bulk_rel_tol: float = 1e-6
     physical_tau_wall_rel_tol: float = 1e-6
     physical_convergence_start_iter: int = 10
+    min_iter: int = 1
+    min_dt_ratio: float = 0.0
 
 
 class BoundaryInfo:

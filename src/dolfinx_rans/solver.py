@@ -292,10 +292,9 @@ def _plot_fields_live(u, p, k, omega, nu_t, domain, geom, Re_tau, step, save_pat
     fig.suptitle(f"Iteration {step}", fontsize=12, fontweight="bold")
     plt.tight_layout()
 
-    # Save numbered snapshot AND latest (for quick viewing)
+    # Save numbered snapshot
     numbered = save_path.parent / f"fields_{step:05d}.png"
     fig.savefig(numbered, dpi=150, bbox_inches="tight")
-    fig.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -836,10 +835,12 @@ def solve_rans_kw(
 
     t = 0.0
     step = 0
-    current_dt = dt
     residual_prev = 1.0
     ema_ratio = 1.0  # EMA of residual_ratio for smooth dt decisions
     ema_alpha = 0.1  # smoothing factor: ~10-step effective window
+    # Initial dt is a starting guess; CFL controls the hard stability ceiling.
+    # We do not use solve.dt as an immutable floor, because large initial values
+    # can override a tightened CFL target and trigger instability.
     prev_u_bulk = None
     prev_tau_wall = None
 
@@ -871,6 +872,17 @@ def solve_rans_kw(
     cell_indices = np.arange(num_local_cells, dtype=np.int32)
     h_cells = _cmesh.h(domain._cpp_object, tdim, cell_indices)
     h_min = float(comm.allreduce(np.min(h_cells), op=MPI.MIN))
+
+    # CFL-driven dt: recompute every step from dt = cfl_target * h_min / u_max.
+    # This is a hard ceiling to prevent velocity-advection instability.
+    cfl_target = float(solve.cfl_target)
+    if cfl_target <= 0.0:
+        raise ValueError("solve.cfl_target must be positive.")
+    u_max_init = float(comm.allreduce(np.max(np.abs(u_.x.array)), op=MPI.MAX))
+    current_dt = min(solve.dt, cfl_target * h_min / max(u_max_init, 1e-12), solve.dt_max)
+    if comm.rank == 0:
+        print(f"  h_min={h_min:.4e}, u_max_init={u_max_init:.3f}")
+        print(f"  CFL_target={cfl_target} → dt_init={current_dt:.4e} (dt_max={solve.dt_max})")
 
     omega_max_limit = 10.0 * omega_wall_val  # Scale wall-driven cap with current case
     ur_kw = solve.under_relax_k_omega
@@ -1184,28 +1196,43 @@ def solve_rans_kw(
         if do_snapshot:
             if is_bfs:
                 from dolfinx_rans.plotting import plot_bfs_fields
-                plot_bfs_fields(u_, p_, k_, omega_, nu_t_, domain, geom, nu, save_path=results_dir / "fields.png")
-                if comm.rank == 0:
-                    import shutil
-                    shutil.copy2(results_dir / "fields.png", results_dir / f"fields_{step:05d}.png")
+                save_path = results_dir / f"bfs_fields{step:07d}.png"
+                plot_bfs_fields(u_, p_, k_, omega_, nu_t_, domain, geom, nu, save_path=save_path)
             else:
                 _plot_fields_live(u_, p_, k_, omega_, nu_t_, domain, geom, Re_tau, step, results_dir / "fields.png")
 
         # Convergence check
         if residual < solve.steady_tol and (not solve.enable_physical_convergence or physical_converged):
-            if comm.rank == 0:
-                print(f"\n*** CONVERGED at iteration {step} (residual = {residual:.2e}) ***")
-            break
+            dt_convergence_ok = True
+            if solve.min_iter > 0 and step < solve.min_iter:
+                dt_convergence_ok = False
+            if solve.min_dt_ratio > 0.0 and current_dt < solve.min_dt_ratio * solve.dt:
+                dt_convergence_ok = False
 
-        # Adaptive dt via EMA-smoothed residual ratio.
-        # Single-step spikes only move ema_ratio by alpha*spike ≈ 0.1×spike,
-        # so dt changes reflect the trend (≈10-step window), not noise.
+            if dt_convergence_ok:
+                if comm.rank == 0:
+                    print(f"\n*** CONVERGED at iteration {step} (residual = {residual:.2e}) ***")
+                break
+
+        # Adaptive dt: CFL ceiling with residual-smoothed growth/shrink.
+        # If outer residual improves, allow growth; if it worsens, shrink quickly.
+        u_max_now = float(comm.allreduce(np.max(np.abs(u_.x.array)), op=MPI.MAX))
+        dt_cfl = cfl_target * h_min / max(u_max_now, 1e-12)
         residual_ratio = residual / max(residual_prev, 1e-15)
         ema_ratio = ema_alpha * residual_ratio + (1.0 - ema_alpha) * ema_ratio
+
+        dt_candidate = current_dt
         if ema_ratio < solve.dt_growth_threshold:
-            current_dt = min(current_dt * solve.dt_growth, solve.dt_max)
+            dt_candidate *= solve.dt_growth
         elif ema_ratio > 1.05:
-            current_dt = max(current_dt * 0.5, solve.dt)
+            dt_candidate *= 0.5
+
+        current_dt = min(dt_candidate, dt_cfl, solve.dt_max)
+        # Safety floor: keep dt from collapsing to machine-scale values where outer
+        # residuals stop changing even though the flow is not physically close.
+        if solve.min_dt_ratio > 0.0:
+            dt_min_abs = solve.min_dt_ratio * solve.dt
+            current_dt = max(current_dt, min(dt_min_abs, dt_cfl, solve.dt_max))
         residual_prev = residual
 
     # Final snapshot
